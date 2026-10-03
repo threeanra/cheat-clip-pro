@@ -215,6 +215,16 @@ async def analyze_video(request: AnalyzeRequest):
 
             logger.info(f"Local video loaded: title='{title}', duration={duration}s, path={uploaded_file_path}")
 
+            if not request.subtitles and not request.skip_transcription and metadata.get("has_audio") is False and not is_mock:
+                yield _sse({
+                    "error": (
+                        "This video does not contain a readable audio track. "
+                        "Upload a video with audible speech or provide a transcript/subtitle file."
+                    ),
+                    "status": 400
+                })
+                return
+
             # ── Step 2: Heatmap via acoustic energy ──────────────────────────
             yield _sse({
                 "step": 2,
@@ -271,6 +281,16 @@ async def analyze_video(request: AnalyzeRequest):
                 except Exception as e:
                     yield _sse({"error": f"Failed to parse manual subtitles: {str(e)}", "status": 400})
                     return
+            elif request.skip_transcription:
+                transcript_lines = []
+                yield _sse({
+                    "step": 3,
+                    "step_progress": 100,
+                    "overall_progress": 70,
+                    "stage": "Transcript Skipped",
+                    "detail": "Continuing without speech transcription as requested.",
+                    "message": "Speech transcription skipped — continuing with available video engagement data."
+                })
             else:
                 loop = asyncio.get_running_loop()
                 progress_queue = asyncio.Queue()
@@ -319,7 +339,10 @@ async def analyze_video(request: AnalyzeRequest):
                             ]
                         else:
                             yield _sse({
-                                "error": "No spoken words were detected in this video file. Ensure the video contains clear audible speech.",
+                                "error": (
+                                    "Whisper could not detect a usable speech transcript in this video. "
+                                    "Ensure the audio contains clear audible speech, or provide a transcript/subtitle file."
+                                ),
                                 "status": 400
                             })
                             return
@@ -457,6 +480,16 @@ async def analyze_video(request: AnalyzeRequest):
                 except Exception as e:
                     yield _sse({"error": f"Failed to parse manual subtitles: {str(e)}", "status": 400})
                     return
+            elif request.skip_transcription:
+                transcript_lines = []
+                yield _sse({
+                    "step": 3,
+                    "step_progress": 100,
+                    "overall_progress": 70,
+                    "stage": "Transcript Skipped",
+                    "detail": "Continuing without subtitles as requested.",
+                    "message": "Subtitle retrieval skipped — continuing with available video engagement data."
+                })
             else:
                 loop = asyncio.get_running_loop()
                 progress_queue = asyncio.Queue()
@@ -737,6 +770,13 @@ async def analyze_video(request: AnalyzeRequest):
             if heatmap else
             "No audience interest data. Use content hooks, energy, and story arcs."
         )
+        transcript_note = (
+            "No speech transcript is available because transcription was skipped at the user's request. "
+            "Do not invent dialogue, quotes, or spoken content. Use only the available timing and engagement data; "
+            "key_quotes and transcript may be empty."
+            if request.skip_transcription and not enriched_transcript else
+            "Use the transcript as the source of truth for dialogue, quotes, and sentence boundaries."
+        )
         focus_instruction = ""
         if request.custom_prompt and request.custom_prompt.strip():
             focus_instruction = (
@@ -750,7 +790,7 @@ async def analyze_video(request: AnalyzeRequest):
 
         prompt = (
             f"You are an expert viral video clip editor finding top clip candidates for TikTok, Instagram Reels, and YouTube Shorts.\n"
-            f"Analyze this YouTube video transcript and find {clip_range} high-performing, standalone clip candidates.\n\n"
+            f"Analyze the available video context and find {clip_range} high-performing, standalone clip candidates.\n\n"
             f"VIDEO CONTEXT:\n"
             f"- Video Title: {title}\n"
             f"{channel_context}"
@@ -777,6 +817,7 @@ async def analyze_video(request: AnalyzeRequest):
             f"================================================================================\n\n"
             f"{duration_instruction}\n\n"
             f"{clip_count_instruction}\n\n"
+            f"TRANSCRIPT AVAILABILITY RULE:\n{transcript_note}\n\n"
             f"{focus_instruction}"
             f"CRITICAL TITLE & ATTRIBUTION RULES (NO FIRST-PERSON 'I' OR 'ME'):\n"
             f"1. NEVER write clip titles or title suggestions using first-person pronouns ('I', 'me', 'my', 'mine', 'myself', or equivalents in other languages such as 'saya', 'aku', 'gue')!\n"
@@ -787,7 +828,7 @@ async def analyze_video(request: AnalyzeRequest):
             f"   - Or use objective, curiosity-driven framing (e.g. 'The Real Truth About...', 'How To Master...', 'Why Most People Fail At...', 'The Harsh Reality of...' / in Indonesian: 'Fakta Sebenarnya Tentang...', 'Cara Menguasai...').\n"
             f"4. Keep titles snappy, viral, engaging, and under 8 words.\n\n"
             f"Transcript (start|end[|interest] text):\n---\n{transcript_text}\n---\n\n"
-            f"Rules: use exact seconds from transcript; clips must start/end at sentence boundaries; do not overlap.\n"
+            f"Rules: use exact seconds from the available data; clips must start/end at sentence boundaries when a transcript exists; do not overlap.\n"
             f"Return clips sorted by virality_score desc."
         )
 
@@ -1050,9 +1091,29 @@ async def analyze_video(request: AnalyzeRequest):
             return
 
         # Fallback clip synthesis if 0 clips were returned after all models
-        if len(analysis_data.get('clips', [])) == 0 and enriched_transcript:
-            logger.info("Generating fallback clips from heatmap and transcript segments...")
-            sorted_lines = sorted(enriched_transcript, key=lambda l: l.get('engagement', 0.0), reverse=True)
+        if len(analysis_data.get('clips', [])) == 0 and (enriched_transcript or request.skip_transcription):
+            logger.info("Generating fallback clips from heatmap and available timing data...")
+            if enriched_transcript:
+                sorted_lines = sorted(enriched_transcript, key=lambda l: l.get('engagement', 0.0), reverse=True)
+            else:
+                sorted_lines = sorted(
+                    [
+                        {
+                            "start": max(0.0, float(point.get("start_time", 0.0)) - 5.0),
+                            "engagement": float(point.get("value", 0.0)),
+                            "text": "",
+                        }
+                        for point in (heatmap or [])
+                    ],
+                    key=lambda l: l.get('engagement', 0.0),
+                    reverse=True,
+                )
+                if not sorted_lines:
+                    fallback_step = 30.0
+                    sorted_lines = [
+                        {"start": start, "engagement": 0.0, "text": ""}
+                        for start in range(0, max(1, int(duration)), int(fallback_step))
+                    ]
             candidate_starts = []
             for l in sorted_lines:
                 s = l['start']

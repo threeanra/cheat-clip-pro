@@ -1055,7 +1055,7 @@ export default function App() {
     return null;
   };
 
-  const handleAnalyze = async (e?: React.FormEvent) => {
+  const handleAnalyze = async (e?: React.FormEvent, skipTranscription = false) => {
     if (e) e.preventDefault();
 
     if (sourceMode === 'upload') {
@@ -1260,6 +1260,7 @@ export default function App() {
           range_end: rangeEndSecs,
           subtitles: subtitlesSource === 'manual' ? manualSubtitlesContent : undefined,
           subtitles_filename: subtitlesSource === 'manual' ? manualSubtitlesFileName : undefined,
+          skip_transcription: skipTranscription,
           target_clip_count: clipCountMode === 'auto' ? 'auto' : targetClipCount,
         }),
       });
@@ -1557,6 +1558,19 @@ export default function App() {
 
   const handleApplyAdjustedClipToResults = (adjustedClip: ViralClip) => {
     if (result && result.clips && trimmerClip) {
+      const oldKey = `${trimmerClip.start_time}_${trimmerClip.end_time}`;
+      const newKey = `${adjustedClip.start_time}_${adjustedClip.end_time}`;
+
+      // Update marked state if it was marked
+      if (markedClips[oldKey]) {
+        setMarkedClips(prev => {
+          const newState = { ...prev };
+          delete newState[oldKey];
+          newState[newKey] = true;
+          return newState;
+        });
+      }
+
       setResult(prev => {
         if (!prev) return prev;
         return {
@@ -3319,7 +3333,7 @@ Transcript:
             <div style={{ flex: 1 }}>
               <h4 style={{ color: '#ef4444', margin: 0, fontSize: '1rem', fontWeight: 700 }}>{t.errors.analysisFailed}</h4>
               {/* Subtitle failure actions */}
-              {(error.toLowerCase().includes("subtitle") || error.toLowerCase().includes("transcript")) ? (
+              {(error.toLowerCase().includes("subtitle") || error.toLowerCase().includes("transcript") || error.toLowerCase().includes("speech") || error.toLowerCase().includes("spoken")) ? (
                 <>
                   <div style={{
                     fontSize: '0.825rem',
@@ -3337,7 +3351,29 @@ Transcript:
                   }}>
                     {error}
                   </div>
-                  <div style={{ marginTop: '0.85rem', display: 'flex', flexWrap: 'wrap', gap: '0.65rem', alignItems: 'center' }}>
+                   <div style={{ marginTop: '0.85rem', display: 'flex', flexWrap: 'wrap', gap: '0.65rem', alignItems: 'center' }}>
+                    {(error.toLowerCase().includes("whisper") || error.toLowerCase().includes("speech") || error.toLowerCase().includes("spoken") || error.toLowerCase().includes("audio track")) && (
+                      <button
+                        type="button"
+                        onClick={() => handleAnalyze(undefined, true)}
+                        disabled={loading}
+                        style={{
+                          background: 'rgba(59, 130, 246, 0.15)',
+                          border: '1px solid rgba(96, 165, 250, 0.45)',
+                          color: '#93c5fd',
+                          borderRadius: '8px',
+                          padding: '0.45rem 0.85rem',
+                          fontSize: '0.8rem',
+                          fontWeight: 600,
+                          cursor: loading ? 'not-allowed' : 'pointer',
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: '0.35rem'
+                        }}
+                      >
+                        ▶ {t.errors.continueWithoutTranscript}
+                      </button>
+                    )}
                     <button
                       type="button"
                       className="glowing-btn"
@@ -4331,64 +4367,94 @@ Transcript:
                           {t.results.previewClip}
                         </button>
 
-                        {(() => {
-                          const clipKey = `${clip.start_time}_${clip.end_time}`;
-                          const clipDlState = clipDownloadStates[clipKey];
-                          const isDl = clipDlState?.status === 'downloading';
-                          const isReady = clipDlState?.status === 'ready';
+                        <div style={{ display: 'flex', gap: '0.5rem' }}>
+                          <button
+                            type="button"
+                            className="form-input"
+                            style={{
+                              width: 'auto',
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              gap: '0.35rem',
+                              padding: '0.4rem 0.85rem',
+                              fontSize: '0.78rem',
+                              borderRadius: '8px',
+                              whiteSpace: 'nowrap',
+                              cursor: 'pointer',
+                              background: 'rgba(234, 179, 8, 0.12)',
+                              border: '1px solid rgba(234, 179, 8, 0.35)',
+                              color: '#facc15',
+                              fontWeight: 600,
+                              transition: 'var(--transition-smooth)'
+                            }}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setTrimmerClip(clip);
+                            }}
+                            title={t.results.adjustDurationTooltip || "Adjust Duration"}
+                          >
+                            {t.results.adjustDuration || "✂️ Adjust"}
+                          </button>
 
-                          return (
-                            <button
-                              type="button"
-                              className="form-input"
-                              disabled={isDl}
-                              style={{
-                                width: 'auto',
-                                display: 'inline-flex',
-                                alignItems: 'center',
-                                gap: '0.35rem',
-                                padding: '0.4rem 0.85rem',
-                                fontSize: '0.78rem',
-                                borderRadius: '8px',
-                                whiteSpace: 'nowrap',
-                                cursor: isDl ? 'not-allowed' : 'pointer',
-                                background: isReady
-                                  ? 'rgba(34, 197, 94, 0.15)'
-                                  : 'rgba(59, 130, 246, 0.12)',
-                                border: isReady
-                                  ? '1px solid rgba(34, 197, 94, 0.4)'
-                                  : '1px solid rgba(59, 130, 246, 0.35)',
-                                color: isReady
-                                  ? '#4ade80'
-                                  : '#60a5fa',
-                                fontWeight: 600,
-                                transition: 'var(--transition-smooth)'
-                              }}
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setTrimmerClip(clip);
-                              }}
-                              title={t.results.downloadRawClipTooltip}
-                            >
-                              {isDl ? (
-                                <>
-                                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" className="spinner-icon" style={{ animation: 'spin 1s linear infinite' }}>
-                                    <circle cx="12" cy="12" r="10" strokeDasharray="32" strokeDashoffset="8"></circle>
-                                  </svg>
-                                  <span>{t.results.downloadingRawClip}</span>
-                                </>
-                              ) : isReady ? (
-                                <>
-                                  <span>✅ {t.results.downloadedRawClip}</span>
-                                </>
-                              ) : (
-                                <>
-                                  <span>✂️ {t.results.downloadRawClip}</span>
-                                </>
-                              )}
-                            </button>
-                          );
-                        })()}
+                          {(() => {
+                            const clipKey = `${clip.start_time}_${clip.end_time}`;
+                            const clipDlState = clipDownloadStates[clipKey];
+                            const isDl = clipDlState?.status === 'downloading';
+                            const isReady = clipDlState?.status === 'ready';
+
+                            return (
+                              <button
+                                type="button"
+                                className="form-input"
+                                disabled={isDl}
+                                style={{
+                                  width: 'auto',
+                                  display: 'inline-flex',
+                                  alignItems: 'center',
+                                  gap: '0.35rem',
+                                  padding: '0.4rem 0.85rem',
+                                  fontSize: '0.78rem',
+                                  borderRadius: '8px',
+                                  whiteSpace: 'nowrap',
+                                  cursor: isDl ? 'not-allowed' : 'pointer',
+                                  background: isReady
+                                    ? 'rgba(34, 197, 94, 0.15)'
+                                    : 'rgba(59, 130, 246, 0.12)',
+                                  border: isReady
+                                    ? '1px solid rgba(34, 197, 94, 0.4)'
+                                    : '1px solid rgba(59, 130, 246, 0.35)',
+                                  color: isReady
+                                    ? '#4ade80'
+                                    : '#60a5fa',
+                                  fontWeight: 600,
+                                  transition: 'var(--transition-smooth)'
+                                }}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleDownloadRawClip(clip, e);
+                                }}
+                                title={t.results.downloadRawClipTooltip}
+                              >
+                                {isDl ? (
+                                  <>
+                                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" className="spinner-icon" style={{ animation: 'spin 1s linear infinite' }}>
+                                      <circle cx="12" cy="12" r="10" strokeDasharray="32" strokeDashoffset="8"></circle>
+                                    </svg>
+                                    <span>{t.results.downloadingRawClip}</span>
+                                  </>
+                                ) : isReady ? (
+                                  <>
+                                    <span>✅ {t.results.downloadedRawClip}</span>
+                                  </>
+                                ) : (
+                                  <>
+                                    <span>{t.results.downloadRawClip}</span>
+                                  </>
+                                )}
+                              </button>
+                            );
+                          })()}
+                        </div>
                       </div>
 
                       {/* Row 2: Secondary Utilities (Copy Timestamp, Copy Details, Show Transcript) */}
@@ -4504,6 +4570,9 @@ Transcript:
         videoDuration={result?.duration || 0}
         transcript={result?.transcript}
         onClose={() => setTrimmerClip(null)}
+        onApply={(adjustedClip) => {
+          handleApplyAdjustedClipToResults(adjustedClip);
+        }}
         onDownload={async (adjustedClip) => {
           handleApplyAdjustedClipToResults(adjustedClip);
           await handleDownloadRawClip(adjustedClip);
