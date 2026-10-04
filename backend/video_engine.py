@@ -1372,8 +1372,11 @@ def render_title_overlay_png(
         text_font = get_font(font_name, title_font_size)
         emoji_font = get_emoji_font(int(title_font_size * 0.90))
 
-    # Content boundaries for aspect ratios (Canvas is 1080x1920)
-    if streamer_preset == "split_top_cam":
+    # Content boundaries for aspect ratios
+    if target_aspect_ratio == "16:9_landscape":
+        content_top = 0
+        content_bot = 1080
+    elif streamer_preset == "split_top_cam":
         if target_aspect_ratio == "16:9":
             content_top = 352
             content_bot = 1568
@@ -1401,10 +1404,12 @@ def render_title_overlay_png(
     est_title_h = int(title_line_count * line_step)
 
     # Title Positioning (100% WYSIWYG matching framing preview):
-    # Preview renders at top: `${title_y_percent}%` on 569px height (which is 1080x1920 canvas).
-    # When title_y_percent is provided, directly map to canvas pixels: 1920 * (title_y_percent / 100.0).
-    if title_y_percent is not None:
+    if target_aspect_ratio == "16:9_landscape":
+        effective_title_y_pct = float(title_y_percent) if title_y_percent is not None else (5.5 if title_line_count >= 3 else (6.5 if title_line_count == 2 else 8.0))
+        title_y = max(10, min(1000, int(round(1080 * (effective_title_y_pct / 100.0)))))
+    elif title_y_percent is not None:
         effective_title_y_pct = float(title_y_percent)
+        title_y = max(10, min(1800, int(round(1920 * (effective_title_y_pct / 100.0)))))
     else:
         if streamer_preset == "split_top_cam":
             effective_title_y_pct = 3.5 if title_line_count >= 3 else 4.5
@@ -1416,8 +1421,7 @@ def render_title_overlay_png(
             effective_title_y_pct = 22.6 if title_line_count >= 3 else (24.5 if title_line_count == 2 else 28.8)
         else:  # 9:16
             effective_title_y_pct = 12.0 if title_line_count >= 3 else (14.5 if title_line_count == 2 else 17.0)
-
-    title_y = max(10, min(1800, int(round(1920 * (effective_title_y_pct / 100.0)))))
+        title_y = max(10, min(1800, int(round(1920 * (effective_title_y_pct / 100.0)))))
 
     # Create transparent canvas
     img = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
@@ -1489,6 +1493,13 @@ def render_title_overlay_png(
     return output_png_path
 
 
+def escape_ass_text(text: str) -> str:
+    """Escapes special ASS subtitle control characters (curly braces, backslashes) to prevent tag injection."""
+    if not text:
+        return ""
+    return str(text).replace("{", "｛").replace("}", "｝").replace("\\", "＼")
+
+
 def generate_ass_file(
     words: List[Dict[str, Any]],
     style_preset: str,
@@ -1527,32 +1538,54 @@ def generate_ass_file(
 
     # 1. Format Title & Determine Line Count
     if title_text and title_position != "none":
+        sanitized_title = escape_ass_text(apply_text_case(title_text, text_case))
         formatted_title, title_line_count = wrap_title_smart(
-            apply_text_case(title_text, text_case),
+            sanitized_title,
             max_single_len=max_wrap_len
         )
     else:
         formatted_title, title_line_count = "", 1
 
+    is_landscape = (target_aspect_ratio == "16:9_landscape")
+    canvas_w = 1920 if is_landscape else 1080
+    canvas_h = 1080 if is_landscape else 1920
+    center_x = 960 if is_landscape else 540
+
     # 2. Font Sizes based on preset, with automatic scale-down for 3+ line titles
-    # Subtitle font sizes based on font_size_preset
-    if font_size_preset == "small":
-        sub_font_size = 65
-    elif font_size_preset == "big":
-        sub_font_size = 94
-    else:  # medium
-        sub_font_size = 78
+    if is_landscape:
+        if font_size_preset == "small":
+            sub_font_size = 40
+        elif font_size_preset == "big":
+            sub_font_size = 58
+        else:
+            sub_font_size = 48
 
-    # Title font sizes based on effective_title_preset
-    if effective_title_preset == "small":
-        title_font_size = 58 if title_line_count >= 3 else 68
-    elif effective_title_preset == "big":
-        title_font_size = 106 if title_line_count >= 3 else 124
-    else:  # medium
-        title_font_size = 82 if title_line_count >= 3 else 94
+        if effective_title_preset == "small":
+            title_font_size = 38 if title_line_count >= 3 else 44
+        elif effective_title_preset == "big":
+            title_font_size = 64 if title_line_count >= 3 else 74
+        else:
+            title_font_size = 50 if title_line_count >= 3 else 58
+    else:
+        if font_size_preset == "small":
+            sub_font_size = 65
+        elif font_size_preset == "big":
+            sub_font_size = 94
+        else:  # medium
+            sub_font_size = 78
 
-    # 3. Content boundaries for aspect ratios (Canvas is 1080x1920)
-    if streamer_preset == "split_top_cam":
+        if effective_title_preset == "small":
+            title_font_size = 58 if title_line_count >= 3 else 68
+        elif effective_title_preset == "big":
+            title_font_size = 106 if title_line_count >= 3 else 124
+        else:  # medium
+            title_font_size = 82 if title_line_count >= 3 else 94
+
+    # 3. Content boundaries for aspect ratios
+    if is_landscape:
+        content_top = 0
+        content_bot = 1080
+    elif streamer_preset == "split_top_cam":
         if target_aspect_ratio == "16:9":
             content_top = 352
             content_bot = 1568
@@ -1583,10 +1616,12 @@ def generate_ass_file(
     sub_align = 5 if subtitle_position_mode == "center" else 2
 
     # Title Positioning (100% WYSIWYG matching framing preview):
-    # Preview renders at top: `${title_y_percent}%` on 569px height (which is 1080x1920 canvas).
-    # When title_y_percent is provided, directly map to canvas pixels: 1920 * (title_y_percent / 100.0).
-    if title_y_percent is not None:
+    if is_landscape:
+        effective_title_y_pct = float(title_y_percent) if title_y_percent is not None else (5.5 if title_line_count >= 3 else (6.5 if title_line_count == 2 else 8.0))
+        title_y = max(10, min(1000, int(round(1080 * (effective_title_y_pct / 100.0)))))
+    elif title_y_percent is not None:
         effective_title_y_pct = float(title_y_percent)
+        title_y = max(10, min(1800, int(round(1920 * (effective_title_y_pct / 100.0)))))
     else:
         if streamer_preset == "split_top_cam":
             effective_title_y_pct = 3.5 if title_line_count >= 3 else 4.5
@@ -1598,11 +1633,18 @@ def generate_ass_file(
             effective_title_y_pct = 22.6 if title_line_count >= 3 else (24.5 if title_line_count == 2 else 28.8)
         else:  # 9:16
             effective_title_y_pct = 12.0 if title_line_count >= 3 else (14.5 if title_line_count == 2 else 17.0)
-
-    title_y = max(10, min(1800, int(round(1920 * (effective_title_y_pct / 100.0)))))
+        title_y = max(10, min(1800, int(round(1920 * (effective_title_y_pct / 100.0)))))
 
     # Subtitle Positioning:
-    if subtitle_position_mode == "center":
+    if is_landscape:
+        if subtitle_position_mode == "center":
+            sub_y = int(round(1080 * (subtitle_center_y_percent / 100.0)))
+            sub_y = max(40, min(1040, sub_y))
+        else:
+            effective_sub_pct = float(subtitle_y_percent) if subtitle_y_percent is not None else 10.0
+            sub_y = int(round(1080 * (1.0 - (effective_sub_pct / 100.0))))
+            sub_y = max(40, min(1040, sub_y))
+    elif subtitle_position_mode == "center":
         sub_y = int(round(1920 * (subtitle_center_y_percent / 100.0)))
         sub_y = max(content_top + 40, min(content_bot - 40, sub_y))
     else:
@@ -1680,8 +1722,8 @@ def generate_ass_file(
 
     ass_header = f"""[Script Info]
 ScriptType: v4.00+
-PlayResX: 1080
-PlayResY: 1920
+PlayResX: {canvas_w}
+PlayResY: {canvas_h}
 ScaledBorderAndShadow: yes
 WrapStyle: 2
 Collisions: Reverse
@@ -1712,7 +1754,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         for line_idx, t_line in enumerate(title_lines):
             line_y = title_y + (line_idx * line_step)
             events.append(
-                f"Dialogue: 1,0:00:00.00,{end_time_str},TitleStyle,,0,0,0,,{{\\q2\\an8\\pos(540,{line_y})}}{t_line}"
+                f"Dialogue: 1,0:00:00.00,{end_time_str},TitleStyle,,0,0,0,,{{\\q2\\an8\\pos({center_x},{line_y})}}{t_line}"
             )
 
     # 4. Add Subtitle Events if captions are enabled (guaranteed ZERO vertical glitch / jumping)
@@ -1723,7 +1765,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             raw_text = clean_caption_text(w.get("word", "").strip())
             if not raw_text:
                 continue
-            w_text = apply_text_case(raw_text, text_case)
+            w_text = escape_ass_text(apply_text_case(raw_text, text_case))
             st = max(0.0, float(w.get("start", 0.0)))
             et = max(st + 0.08, float(w.get("end", st + 0.25)))
             valid_words.append({"word_text": w_text, "start": st, "end": et, "raw": w})
@@ -1803,9 +1845,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                         line_parts.append(w_txt)
 
                 styled_line = " ".join(line_parts)
-                # Lock position to sub_y with \q2\an{sub_align}\pos(540, sub_y) (zero vertical jump / collision)
+                # Lock position to sub_y with \q2\an{sub_align}\pos(center_x, sub_y)
                 events.append(
-                    f"Dialogue: 0,{format_ass_timestamp(w_start)},{format_ass_timestamp(w_end)},SubStyle,,0,0,0,,{{\\q2\\an{sub_align}\\pos(540,{sub_y})}}{styled_line}"
+                    f"Dialogue: 0,{format_ass_timestamp(w_start)},{format_ass_timestamp(w_end)},SubStyle,,0,0,0,,{{\\q2\\an{sub_align}\\pos({center_x},{sub_y})}}{styled_line}"
                 )
 
     ass_content = ass_header + "\n".join(events) + "\n"
@@ -2426,6 +2468,16 @@ def build_ffmpeg_filtergraph(
                     f"[main_base][pip_box]overlay=x={pip_x}:y={pip_y}[layout_base]"
                 )
 
+        elif aspect_ratio == "16:9_landscape":
+            crop_main = "crop='min(iw,ih*16/9)':'min(ih,iw*9/16)':'(iw-min(iw,ih*16/9))/2':'(ih-min(ih,iw*9/16))/2',scale=1920:1080"
+            pip_x, pip_y = 1550, 780
+            filters.append(
+                f"[0:v]split=2[main_raw][pip_raw];"
+                f"[main_raw]{crop_main}[main_base];"
+                f"{pip_crop}"
+                f"[main_base][pip_box]overlay=x={pip_x}:y={pip_y}[layout_base]"
+            )
+
         elif aspect_ratio == "16:9":
             crop_main = "crop='min(iw,ih*16/9)':'min(ih,iw*9/16)':'(iw-min(iw,ih*16/9))/2':'(ih-min(ih,iw*9/16))/2',scale=1080:608"
             pip_x, pip_y = 736, 676
@@ -2514,6 +2566,18 @@ def build_ffmpeg_filtergraph(
             )
         current_v = "[layout_base]"
 
+    elif aspect_ratio == "16:9_landscape":
+        # True 16:9 Landscape (1920x1080)
+        safe_cx = float(face_cx)
+        if 0.46 <= safe_cx <= 0.54:
+            safe_cx = 0.50
+        safe_cx = max(0.15, min(0.85, safe_cx))
+        crop_169_land = f"crop='min(iw,ih*16/9)':'min(ih,iw*9/16)':'max(0,min(iw-ih*16/9,iw*{safe_cx:.3f}-(ih*16/9)/2))':'(ih-min(ih,iw*9/16))/2',scale=1920:1080"
+        filters.append(
+            f"[0:v]{crop_169_land}[layout_base]"
+        )
+        current_v = "[layout_base]"
+
     else:  # 16:9 Letterbox
         # 16:9 Letterbox (1080x608) - Smart crop with speaker/object centering for ultrawide sources
         safe_cx = float(face_cx)
@@ -2551,11 +2615,12 @@ def build_ffmpeg_filtergraph(
         # Fallback drawtext if no ASS was generated
         clean_title = title_text.replace("'", "").replace(":", "-").replace('"', "").strip()
         if title_y_percent is not None:
-            y_pos = int(round(1920 * (float(title_y_percent) / 100.0)))
+            canvas_h = 1080 if aspect_ratio == "16:9_landscape" else 1920
+            y_pos = int(round(canvas_h * (float(title_y_percent) / 100.0)))
         elif streamer_preset == "split_top_cam":
             y_pos = int(round(1920 * 0.045))
         else:
-            y_pos = 345 if aspect_ratio == "1:1" else (480 if aspect_ratio in ["4:3", "9:16"] else 581)
+            y_pos = 80 if aspect_ratio == "16:9_landscape" else (345 if aspect_ratio == "1:1" else (480 if aspect_ratio in ["4:3", "9:16"] else 581))
         box_style = "box=0"
         title_filter = (
             f"{current_v}drawtext=text='{clean_title}':fontsize=60:fontcolor=white:"
@@ -2702,8 +2767,9 @@ def render_clip_to_mp4(
             input_idx_counter += 1
             extra_input_args.extend(["-i", str(watermark_image_path)])
 
-            # Canvas width is 1080. Calculate watermark width based on percentage (0-500%)
-            wm_w = max(16, min(5400, int(1080 * (float(watermark_size) / 100.0))))
+            # Canvas width is 1920 for landscape or 1080 for vertical. Calculate watermark width based on percentage (0-500%)
+            canvas_w = 1920 if aspect_ratio == "16:9_landscape" else 1080
+            wm_w = max(16, min(5400, int(canvas_w * (float(watermark_size) / 100.0))))
             wm_prep = f"[{wm_idx}:v]format=rgba,colorchannelmixer=aa={wm_opacity:.2f},scale={wm_w}:-1[wm_proc]"
             filter_chains.append(wm_prep)
 
