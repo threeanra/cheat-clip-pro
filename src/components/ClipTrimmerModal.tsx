@@ -12,6 +12,7 @@ interface ClipTrimmerModalProps {
   videoDuration: number;
   transcript?: TranscriptLine[];
   onClose: () => void;
+  onApply: (adjustedClip: ViralClip) => void;
   onDownload: (adjustedClip: ViralClip) => Promise<void> | void;
 }
 
@@ -55,6 +56,7 @@ export const ClipTrimmerModal: React.FC<ClipTrimmerModalProps> = ({
   videoDuration,
   transcript = [],
   onClose,
+  onApply,
   onDownload,
 }) => {
   const { t } = useLanguage();
@@ -1533,7 +1535,7 @@ export const ClipTrimmerModal: React.FC<ClipTrimmerModalProps> = ({
             {t.trimmer.resetBtn}
           </button>
 
-          {/* Right: Close & Download Buttons */}
+          {/* Right: Close, Apply & Download Buttons */}
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
             <button
               type="button"
@@ -1550,6 +1552,35 @@ export const ClipTrimmerModal: React.FC<ClipTrimmerModalProps> = ({
               }}
             >
               {t.trimmer.closeBtn}
+            </button>
+
+            <button
+              type="button"
+              disabled={isDownloading || (adjustedStart === (clip?.start_time ?? 0) && adjustedEnd === (clip?.end_time ?? 0))}
+              onClick={() => {
+                onApply(getAdjustedClip());
+                onClose();
+              }}
+              style={{
+                background: (adjustedStart === (clip?.start_time ?? 0) && adjustedEnd === (clip?.end_time ?? 0))
+                  ? 'rgba(100, 116, 139, 0.25)'
+                  : 'linear-gradient(135deg, #eab308, #ca8a04)',
+                border: 'none',
+                color: '#fff',
+                borderRadius: '8px',
+                padding: '0.5rem 1.3rem',
+                fontSize: '0.84rem',
+                fontWeight: 700,
+                cursor: (adjustedStart === (clip?.start_time ?? 0) && adjustedEnd === (clip?.end_time ?? 0)) ? 'not-allowed' : 'pointer',
+                opacity: (adjustedStart === (clip?.start_time ?? 0) && adjustedEnd === (clip?.end_time ?? 0)) ? 0.4 : 1,
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '0.45rem',
+                boxShadow: (adjustedStart === (clip?.start_time ?? 0) && adjustedEnd === (clip?.end_time ?? 0)) ? 'none' : '0 4px 16px rgba(234, 179, 8, 0.35)',
+                transition: 'var(--transition-smooth)'
+              }}
+            >
+              {t.trimmer.applyBtn || '✅ Apply'}
             </button>
 
             <button

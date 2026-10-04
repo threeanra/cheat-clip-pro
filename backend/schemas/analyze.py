@@ -38,6 +38,7 @@ class AnalyzeRequest(BaseModel):
     range_end: Optional[float] = Field(None, description="Search range end in seconds")
     subtitles: Optional[str] = Field(None, description="Optional manual subtitles text (SRT or TXT)")
     subtitles_filename: Optional[str] = Field(None, description="Optional manual subtitles filename")
+    skip_transcription: bool = Field(False, description="Continue analysis without speech transcription when no transcript is available")
     target_clip_count: Optional[Union[int, str]] = Field(None, description="Optional target number of clips or 'auto'")
     proxy: Optional[str] = Field(None, description="Optional custom proxy URL")
 

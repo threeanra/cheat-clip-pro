@@ -40,6 +40,22 @@ CASCADES_DIR.mkdir(parents=True, exist_ok=True)
 UPLOADS_DIR = TEMP_DIR / "uploads"
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
+def _ffmpeg_has_filter(executable: str, filter_name: str) -> bool:
+    """Returns whether an FFmpeg binary exposes the requested filter."""
+    try:
+        result = subprocess.run(
+            [executable, "-hide_banner", "-filters"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        return result.returncode == 0 and re.search(
+            rf"(?m)^\s*\S+\s+{re.escape(filter_name)}\s+", result.stdout or ""
+        ) is not None
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def ensure_ffmpeg_in_path():
     """Auto-detect FFmpeg if it was installed via winget, scoop, or local paths but not in PATH."""
     current_path = os.environ.get("PATH") or os.environ.get("Path") or ""
@@ -56,7 +72,8 @@ def ensure_ffmpeg_in_path():
     except Exception:
         pass
 
-    if not shutil.which("ffmpeg"):
+    ffmpeg_path = shutil.which("ffmpeg")
+    if not ffmpeg_path or not _ffmpeg_has_filter(ffmpeg_path, "subtitles"):
         local_app_data = os.environ.get("LOCALAPPDATA", "")
         user_profile = os.environ.get("USERPROFILE", "")
         prog_files = os.environ.get("ProgramFiles", "C:\\Program Files")
@@ -72,19 +89,30 @@ def ensure_ffmpeg_in_path():
             Path("C:/ffmpeg/bin"),
             Path("C:/Program Files/ffmpeg/bin"),
         ]
+
+        # Homebrew's standard formula omits libass; ffmpeg-full is keg-only.
+        if sys.platform == "darwin":
+            candidate_roots.extend([
+                Path("/opt/homebrew/opt/ffmpeg-full/bin"),
+                Path("/usr/local/opt/ffmpeg-full/bin"),
+            ])
+
         for root in candidate_roots:
             if root and root.exists():
-                if (root / "ffmpeg.exe").exists() or (root / "ffmpeg").exists():
+                executable = root / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+                if executable.exists() and _ffmpeg_has_filter(str(executable), "subtitles"):
                     r_str = str(root.resolve())
                     if r_str not in path_parts:
                         path_parts.insert(0, r_str)
-                    logger.info(f"Auto-added FFmpeg to PATH: {r_str}")
+                    logger.info(f"Auto-added subtitle-capable FFmpeg to PATH: {r_str}")
                     break
-                for exe in root.glob("**/ffmpeg.exe"):
+                for exe in root.glob("**/ffmpeg.exe" if os.name == "nt" else "**/ffmpeg"):
+                    if not _ffmpeg_has_filter(str(exe), "subtitles"):
+                        continue
                     bin_dir = str(exe.parent.resolve())
                     if bin_dir not in path_parts:
                         path_parts.insert(0, bin_dir)
-                    logger.info(f"Auto-added FFmpeg to PATH: {bin_dir}")
+                    logger.info(f"Auto-added subtitle-capable FFmpeg to PATH: {bin_dir}")
                     break
 
     # Re-assign unified PATH
@@ -466,6 +494,46 @@ def compute_audio_energy_heatmap(file_path: Union[str, Path], duration: float, n
     return heatmap
 
 
+def _extract_audio_for_transcription(file_path: Union[str, Path]) -> Path:
+    """Convert a media file to a Whisper-compatible mono WAV track."""
+    audio_path = TEMP_DIR / f"whisper_audio_{time.time_ns()}.wav"
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-i", str(file_path),
+        "-map", "0:a:0?",
+        "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
+        str(audio_path),
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "FFmpeg is required to extract the video's audio track for transcription."
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Audio extraction timed out before transcription could start.") from exc
+
+    if result.returncode != 0 or not audio_path.exists() or audio_path.stat().st_size <= 44:
+        try:
+            audio_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+        stderr = (result.stderr or "").lower()
+        if "does not contain any stream" in stderr or "matches no streams" in stderr:
+            raise RuntimeError(
+                "This video does not contain a readable audio track. "
+                "Upload a video with audio or provide a transcript/subtitle file."
+            )
+        raise RuntimeError(
+            "The video's audio track could not be decoded for transcription. "
+            "Please re-encode the video or provide a transcript/subtitle file."
+        )
+
+    return audio_path
+
+
 def transcribe_local_video_file(file_path: Union[str, Path], progress_callback=None) -> List[Dict[str, Any]]:
     """
     Transcribes speech from a local video or audio file using OpenAI Whisper.
@@ -486,27 +554,48 @@ def transcribe_local_video_file(file_path: Union[str, Path], progress_callback=N
     if progress_callback:
         progress_callback("Running Whisper AI", f"Extracting dialogue from {p.name} with Whisper...", 30)
 
-    logger.info(f"Transcribing local file with Whisper: {p}")
-    result = whisper_model.transcribe(str(p), word_timestamps=True, fp16=False, verbose=False)
-    
-    segments = result.get("segments", [])
-    transcript_lines = []
-    
-    for seg in segments:
-        text = seg.get("text", "").strip()
-        if not text:
-            continue
-        start = round(float(seg.get("start", 0.0)), 2)
-        end = round(float(seg.get("end", start + 2.0)), 2)
-        dur = round(max(0.4, end - start), 2)
-        transcript_lines.append({
-            "text": text,
-            "start": start,
-            "duration": dur
-        })
-        
-    logger.info(f"Whisper transcribed {len(transcript_lines)} dialogue segments from {p.name}")
-    return transcript_lines
+    audio_path = None
+    try:
+        audio_path = _extract_audio_for_transcription(p)
+        logger.info(f"Transcribing local file with Whisper: {p} (audio: {audio_path.name})")
+        result = whisper_model.transcribe(
+            str(audio_path),
+            word_timestamps=True,
+            fp16=False,
+            verbose=False,
+            condition_on_previous_text=False,
+        )
+
+        segments = result.get("segments", [])
+        transcript_lines = []
+
+        for seg in segments:
+            text = seg.get("text", "").strip()
+            if not text:
+                text = " ".join(
+                    word.get("word", "").strip()
+                    for word in seg.get("words", [])
+                    if word.get("word", "").strip()
+                ).strip()
+            if not text:
+                continue
+            start = round(float(seg.get("start", 0.0)), 2)
+            end = round(float(seg.get("end", start + 2.0)), 2)
+            dur = round(max(0.4, end - start), 2)
+            transcript_lines.append({
+                "text": text,
+                "start": start,
+                "duration": dur
+            })
+
+        logger.info(f"Whisper transcribed {len(transcript_lines)} dialogue segments from {p.name}")
+        return transcript_lines
+    finally:
+        if audio_path is not None:
+            try:
+                audio_path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning(f"Could not remove temporary transcription audio: {audio_path}")
 
 
 def download_clip_segment(
@@ -2513,13 +2602,13 @@ def build_ffmpeg_filtergraph(
     # (If ass_subtitles_path is provided, it contains BOTH the title and subtitles rendered with exact matching fonts)
     if ass_subtitles_path and os.path.exists(ass_subtitles_path):
         raw_ass = str(Path(ass_subtitles_path).resolve()).replace("\\", "/")
-        escaped_ass = raw_ass.replace(":", "\\:").replace("'", "'\\''")
+        escaped_ass = raw_ass.replace("'", "'\\''").replace(":", "\\:")
         if FONTS_DIR.exists() and any(FONTS_DIR.glob("*.ttf")):
             raw_fonts = str(FONTS_DIR.resolve()).replace("\\", "/")
-            escaped_fonts = raw_fonts.replace(":", "\\:").replace("'", "'\\''")
-            sub_filter = f"{current_v}subtitles='{escaped_ass}':fontsdir='{escaped_fonts}'[v_final]"
+            escaped_fonts = raw_fonts.replace("'", "'\\''").replace(":", "\\:")
+            sub_filter = f"{current_v}subtitles=filename='{escaped_ass}':fontsdir='{escaped_fonts}'[v_final]"
         else:
-            sub_filter = f"{current_v}subtitles='{escaped_ass}'[v_final]"
+            sub_filter = f"{current_v}subtitles=filename='{escaped_ass}'[v_final]"
         filters.append(sub_filter)
         current_v = "[v_final]"
     elif title_text and title_position != "none":
@@ -2611,6 +2700,14 @@ def render_clip_to_mp4(
             "Source video segment is incomplete or corrupted ('moov atom not found'). "
             "This usually happens when internet lags during download. Please retry rendering this clip."
         )
+
+    if ass_subtitles_path and os.path.exists(ass_subtitles_path):
+        ffmpeg_path = shutil.which("ffmpeg")
+        if not ffmpeg_path or not _ffmpeg_has_filter(ffmpeg_path, "subtitles"):
+            raise RuntimeError(
+                "Subtitle rendering requires an FFmpeg build with libass (the 'subtitles' filter). "
+                "On macOS, install it with 'brew install ffmpeg-full' and restart the backend."
+            )
 
     is_streamer = streamer_preset in ["pip_corner", "split_top_cam"]
     default_cx = 0.85 if is_streamer else 0.50

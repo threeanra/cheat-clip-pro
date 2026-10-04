@@ -1,0 +1,11 @@
+{
+    "schema_version": 2,
+    "commit": "d8217aec02eedb618078519385cf4ead9738951f",
+    "indexed_at": "2026-10-01T14:51:50Z",
+    "project": "cheat-clip-pro",
+    "nodes": 922,
+    "edges": 2774,
+    "original_size": 38076416,
+    "compressed_size": 821129,
+    "compression_level": 9
+}
