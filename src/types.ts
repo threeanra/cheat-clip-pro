@@ -56,26 +56,36 @@ export type CaptionFont =
   | 'Bebas Neue' 
   | 'Anton' 
   | 'Poppins' 
-  | 'Arial Black';
+  | 'Arial Black'
+  | (string & {});
 export type TitlePosition = 'auto' | 'safe_zone' | 'middle' | 'none';
 export type TitleDurationOption = 'entire' | '5s' | '10s';
 export type SubtitlePositionMode = 'bottom' | 'center';
 export type StreamerPreset = 'none' | 'split_top_cam' | 'pip_corner';
 export type FacecamPosition = 'auto' | 'bottom_right' | 'top_right' | 'bottom_left' | 'top_left' | 'center' | 'left' | 'right';
-export type FontSizeOption = 'small' | 'medium' | 'big';
+export type FontSizeOption = 'small' | 'medium' | 'big' | 'custom';
 export type TextCaseOption = 'uppercase' | 'capitalize' | 'lowercase';
-export type HardwareAccelOption = 'auto' | 'nvenc' | 'amf' | 'qsv' | 'cpu';
+export type HardwareAccelOption = 'auto' | 'nvenc' | 'amf' | 'qsv' | 'cpu' | 'browser_wasm' | 'client_gpu';
+
+export interface FontItem {
+  name: string;
+  is_custom: boolean;
+  filename?: string | null;
+  url?: string | null;
+}
 
 export interface HardwareAccelInfo {
   status: string;
   active_default: string;
   recommended: string;
+  gpu_name?: string | null;
   support: {
     nvenc: boolean;
     amf: boolean;
     qsv: boolean;
     cpu: boolean;
     recommended: string;
+    gpu_name?: string | null;
   };
   options: Array<{
     id: HardwareAccelOption;
@@ -86,6 +96,7 @@ export interface HardwareAccelInfo {
 }
 
 export interface RenderSettings {
+  renderEngine?: 'server' | 'client';
   aspectRatio: AspectRatioOption;
   backgroundStyle: BackgroundStyle;
   enableFaceTracking: boolean;
@@ -98,11 +109,15 @@ export interface RenderSettings {
   fileNameSuffix?: string;
   titlePosition: TitlePosition;
   titleDuration?: TitleDurationOption;
+  titleFont?: CaptionFont;
   titleFontSize?: FontSizeOption;
+  titleFontSizePx?: number;
+  titleTextCase?: TextCaseOption;
   subtitlesEnabled?: boolean;
   captionStyle: CaptionStyle;
   captionFont: CaptionFont;
   fontSize: FontSizeOption;
+  fontSizePx?: number;
   textCase: TextCaseOption;
   titleYPercent?: number;
   subtitleYPercent?: number;
@@ -134,6 +149,9 @@ export interface RenderSettings {
   watermarkY?: number; // 0 to 100%
   // Hardware Acceleration / Video Encoder
   hardwareAccel?: HardwareAccelOption;
+  // Multi-Segment Merged Highlight Video
+  renderMode?: 'separate' | 'merged';
+  compilationTitle?: string;
 }
 
 export interface RenderClipStatus {

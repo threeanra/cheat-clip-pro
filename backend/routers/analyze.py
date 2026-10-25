@@ -5,7 +5,7 @@ import os
 import re
 from typing import List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Header
 from fastapi.responses import StreamingResponse
 from google import genai
 from google.genai import types
@@ -32,11 +32,21 @@ from backend.services.ai_service import (
     get_flash_models_for_key,
     list_available_gemini_models,
 )
+from backend.services.openrouter_service import (
+    fetch_openrouter_available_models,
+    get_openrouter_fallback_chain,
+    analyze_with_openrouter,
+)
 from backend.services.gdrive_service import (
     download_google_drive_video,
     is_google_drive_url,
 )
+from backend.services.system_service import (
+    is_server_environment,
+    is_update_allowed,
+)
 from backend.services.youtube_service import (
+    download_youtube_audio_file,
     fetch_transcript,
     fetch_video_metadata,
     get_supadata_keys,
@@ -47,11 +57,128 @@ from backend.utils.proxy import get_proxy_url
 from backend.utils.sse import _sse
 from backend.utils.text import (
     detect_transcript_language,
+    validate_transcript_language,
     extract_video_id,
     lowercase_hashtags_in_string,
     parse_manual_subtitles,
     sanitize_first_person_title,
 )
+
+
+def _format_parsed_dict(data: dict, channel: str, lang_code: str) -> dict:
+    raw_clips = data.get("clips") or []
+    formatted_clips = []
+    for c in raw_clips:
+        if not isinstance(c, dict):
+            continue
+        title = sanitize_first_person_title(str(c.get('title', '')), channel, lang=lang_code)
+        title_sug = sanitize_first_person_title(str(c.get('title_suggestion', '')), channel, lang=lang_code)
+        formatted_clips.append({
+            "title": title,
+            "start_time": float(c.get('start_time', 0.0) or 0.0),
+            "end_time": float(c.get('end_time', 0.0) or 0.0),
+            "hook_time": float(c.get('hook_time')) if c.get('hook_time') is not None else None,
+            "virality_score": int(c.get('virality_score', 0) or 0),
+            "key_quotes": c.get('key_quotes') if isinstance(c.get('key_quotes'), list) else [],
+            "title_suggestion": title_sug,
+            "caption_suggestion": str(c.get('caption_suggestion', '') or ''),
+            "hashtag_suggestion": str(c.get('hashtag_suggestion', '') or ''),
+        })
+    return {
+        "summary": str(data.get("summary", "") or ""),
+        "clips": formatted_clips
+    }
+
+
+def parse_lenient_json_analysis(raw_text: str, channel: str = "", lang_code: str = "en") -> Optional[dict]:
+    """Robust parser that extracts and repairs structured analysis even if truncated, unescaped, or containing trailing commas."""
+    if not raw_text or not raw_text.strip():
+        return None
+    
+    clean_text = raw_text.strip()
+    if clean_text.startswith("```"):
+        clean_text = re.sub(r"^```[a-zA-Z]*\n?", "", clean_text)
+        clean_text = re.sub(r"\n?```$", "", clean_text)
+    clean_text = clean_text.strip()
+
+    # 1. Standard json parse
+    try:
+        data = json.loads(clean_text)
+        if isinstance(data, dict):
+            return _format_parsed_dict(data, channel, lang_code)
+    except Exception:
+        pass
+
+    # 2. Fix trailing commas (e.g. [...,])
+    try:
+        no_trailing_commas = re.sub(r',\s*([\]}])', r'\1', clean_text)
+        data = json.loads(no_trailing_commas)
+        if isinstance(data, dict):
+            return _format_parsed_dict(data, channel, lang_code)
+    except Exception:
+        pass
+
+    # 3. Truncated JSON repair (recovers clips when output was cut off mid-response)
+    try:
+        last_brace_idx = clean_text.rfind("}")
+        if last_brace_idx != -1:
+            truncated_candidate = clean_text[:last_brace_idx + 1]
+            if '"clips"' in truncated_candidate:
+                if not truncated_candidate.endswith("]}"):
+                    if truncated_candidate.endswith("]"):
+                        truncated_candidate += "}"
+                    else:
+                        truncated_candidate += "\n]}"
+                truncated_candidate = re.sub(r',\s*([\]}])', r'\1', truncated_candidate)
+                data = json.loads(truncated_candidate)
+                if isinstance(data, dict):
+                    return _format_parsed_dict(data, channel, lang_code)
+    except Exception:
+        pass
+
+    # 4. Lenient Regex-based Clip Extraction (recovers individual clips even with corrupted JSON syntax)
+    try:
+        clips_list = []
+        summary_match = re.search(r'"summary"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', clean_text)
+        summary = summary_match.group(1).encode().decode('unicode_escape') if summary_match else ""
+
+        raw_clip_blocks = re.findall(r'\{[^{}]*?"(?:title|start_time)"[^{}]*?\}', clean_text, re.DOTALL)
+        for block in raw_clip_blocks:
+            try:
+                clip_obj = json.loads(block)
+            except Exception:
+                title_m = re.search(r'"title"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', block)
+                start_m = re.search(r'"start_time"\s*:\s*([\d\.]+)', block)
+                end_m = re.search(r'"end_time"\s*:\s*([\d\.]+)', block)
+                hook_m = re.search(r'"hook_time"\s*:\s*([\d\.]+)', block)
+                score_m = re.search(r'"virality_score"\s*:\s*(\d+)', block)
+                sug_m = re.search(r'"title_suggestion"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', block)
+                cap_m = re.search(r'"caption_suggestion"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', block)
+                tag_m = re.search(r'"hashtag_suggestion"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', block)
+                quotes_m = re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"', block)
+
+                clip_obj = {
+                    "title": title_m.group(1) if title_m else "",
+                    "start_time": float(start_m.group(1)) if start_m else 0.0,
+                    "end_time": float(end_m.group(1)) if end_m else 0.0,
+                    "hook_time": float(hook_m.group(1)) if hook_m else None,
+                    "virality_score": int(score_m.group(1)) if score_m else 75,
+                    "key_quotes": quotes_m[:2] if quotes_m else [],
+                    "title_suggestion": sug_m.group(1) if sug_m else "",
+                    "caption_suggestion": cap_m.group(1) if cap_m else "",
+                    "hashtag_suggestion": tag_m.group(1) if tag_m else "",
+                }
+
+            if clip_obj.get("start_time", 0.0) or clip_obj.get("end_time", 0.0) or clip_obj.get("title"):
+                clips_list.append(clip_obj)
+
+        if clips_list:
+            return _format_parsed_dict({"summary": summary, "clips": clips_list}, channel, lang_code)
+    except Exception as e:
+        logger.warning(f"Lenient regex parsing error: {e}")
+
+    return None
+
 
 router = APIRouter(tags=["Analyze"])
 
@@ -77,6 +204,8 @@ def health_check(refresh: bool = False):
         "status": "ok",
         "message": "CHEAT CLIP PRO API is active",
         "is_vercel": is_vercel,
+        "is_server": is_server_environment(),
+        "allow_app_updates": is_update_allowed(),
         "proxy_configured": bool(proxy),
         "gemini_env_configured": has_gemini,
         "supadata_keys_count": len(keys),
@@ -91,9 +220,32 @@ def supadata_usage_endpoint(refresh: bool = False):
 
 
 @router.get("/api/models")
-def list_available_models(api_key: str = ""):
-    """Fetches list of available Gemini models using the user's API key, prioritizing Flash models (newest first)."""
-    models = list_available_gemini_models(api_key)
+def list_available_models(
+    api_key: str = "",
+    x_gemini_api_key: Optional[str] = Header(None, alias="X-Gemini-API-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    """Fetches list of available Gemini models using the user's API key, prioritizing Flash models (newest first).
+    Accepts API key securely via X-Gemini-API-Key or Authorization Bearer header, with query parameter fallback.
+    """
+    token_from_auth = authorization.replace("Bearer ", "").strip() if (authorization and authorization.startswith("Bearer ")) else None
+    effective_key = (x_gemini_api_key or token_from_auth or api_key or "").strip()
+    models = list_available_gemini_models(effective_key)
+    return {"models": models}
+
+
+@router.get("/api/openrouter-models")
+async def list_openrouter_models_endpoint(
+    api_key: str = "",
+    x_openrouter_api_key: Optional[str] = Header(None, alias="X-OpenRouter-API-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    """Fetches list of available OpenRouter text-based LLM models.
+    Accepts API key securely via X-OpenRouter-API-Key or Authorization Bearer header, with query parameter fallback.
+    """
+    token_from_auth = authorization.replace("Bearer ", "").strip() if (authorization and authorization.startswith("Bearer ")) else None
+    effective_key = (x_openrouter_api_key or token_from_auth or api_key or "").strip()
+    models = await fetch_openrouter_available_models(effective_key)
     return {"models": models}
 
 
@@ -102,12 +254,19 @@ async def analyze_video(request: AnalyzeRequest):
     """Stream real-time progress via Server-Sent Events, then deliver the final result."""
 
     async def stream():
+        api_provider = (request.api_provider or "gemini").lower().strip()
         gemini_key = (request.api_key or os.environ.get("GEMINI_API_KEY") or '').strip()
-        is_mock = gemini_key.lower() == "mock"
+        openrouter_key = (request.openrouter_key or request.api_key or os.environ.get("OPENROUTER_API_KEY") or '').strip()
+        is_mock = (gemini_key.lower() == "mock") if api_provider == "gemini" else False
 
-        if not gemini_key:
-            yield _sse({"error": "Gemini API Key is required. Enter it in the web interface.", "status": 400})
-            return
+        if api_provider == "openrouter":
+            if not openrouter_key:
+                yield _sse({"error": "OpenRouter API Key is required. Please enter it in AI Engine Settings.", "status": 400})
+                return
+        else:
+            if not gemini_key:
+                yield _sse({"error": "Gemini API Key is required. Enter it in the web interface.", "status": 400})
+                return
 
         # ── Step 1: Detect Source Type & Extract Metadata ───────────────────
         req_clean = request.url.strip()
@@ -160,25 +319,27 @@ async def analyze_video(request: AnalyzeRequest):
         elif (UPLOADS_DIR / os.path.basename(req_clean.split("?")[0])).exists():
             is_uploaded = True
         else:
-            matches = list(UPLOADS_DIR.glob(f"*{req_clean}*"))
-            if matches:
+            from backend.routers.media import _find_video_file_on_disk
+            found_candidate = _find_video_file_on_disk(req_clean)
+            if found_candidate and found_candidate.exists():
                 is_uploaded = True
+                uploaded_file_path = found_candidate
 
         if is_uploaded:
             if uploaded_file_path is None:
-                if os.path.exists(req_clean):
+                from backend.routers.media import _find_video_file_on_disk
+                found = _find_video_file_on_disk(req_clean)
+                if found and found.exists():
+                    uploaded_file_path = found
+                elif os.path.exists(req_clean):
                     uploaded_file_path = Path(req_clean)
                 elif (UPLOADS_DIR / os.path.basename(req_clean.split("?")[0])).exists():
                     uploaded_file_path = UPLOADS_DIR / os.path.basename(req_clean.split("?")[0])
                 elif (TEMP_DIR / os.path.basename(req_clean.split("?")[0])).exists():
                     uploaded_file_path = TEMP_DIR / os.path.basename(req_clean.split("?")[0])
                 else:
-                    matches = list(UPLOADS_DIR.glob(f"*{req_clean}*"))
-                    if matches:
-                        uploaded_file_path = matches[0]
-                    else:
-                        yield _sse({"error": "Uploaded video file not found on disk. Please upload again.", "status": 404})
-                        return
+                    yield _sse({"error": "Uploaded video file not found on disk. Please upload again.", "status": 404})
+                    return
 
             video_id = uploaded_file_path.stem
             canonical_url = req_clean if is_gdrive else f"/api/video/{uploaded_file_path.name}"
@@ -257,6 +418,13 @@ async def analyze_video(request: AnalyzeRequest):
                 })
 
             # ── Step 3: Speech Recognition via Whisper AI ───────────────────
+            expected_video_lang = None
+            req_lang = (request.transcript_language or "").lower().strip()
+            if req_lang in ("id", "in"):
+                expected_video_lang = "id"
+            elif req_lang == "en":
+                expected_video_lang = "en"
+
             if request.subtitles:
                 yield _sse({
                     "step": 3,
@@ -270,13 +438,20 @@ async def analyze_video(request: AnalyzeRequest):
                     transcript_lines = parse_manual_subtitles(request.subtitles, duration)
                     if not transcript_lines:
                         raise Exception("Custom subtitles parsed into empty array.")
+                    check_man = validate_transcript_language(transcript_lines, title=title)
+                    if not check_man['is_supported']:
+                        yield _sse({
+                            "error": f"Bahasa subtitle tidak didukung: terdeteksi {check_man['name']}. Cheat Clip Pro hanya memproses bahasa Indonesia dan Inggris.",
+                            "status": 400
+                        })
+                        return
                     yield _sse({
                         "step": 3,
                         "step_progress": 100,
                         "overall_progress": 70,
                         "stage": "Subtitles Ready",
-                        "detail": f"Custom subtitles parsed — {len(transcript_lines)} timestamped lines loaded.",
-                        "message": f"Custom subtitles parsed — {len(transcript_lines)} lines loaded successfully."
+                        "detail": f"Custom subtitles parsed — {len(transcript_lines)} timestamped lines loaded ({check_man['name']}).",
+                        "message": f"Custom subtitles parsed — {len(transcript_lines)} lines loaded successfully ({check_man['name']})."
                     })
                 except Exception as e:
                     yield _sse({"error": f"Failed to parse manual subtitles: {str(e)}", "status": 400})
@@ -316,19 +491,28 @@ async def analyze_video(request: AnalyzeRequest):
 
                 try:
                     task = asyncio.create_task(
-                        asyncio.to_thread(transcribe_local_video_file, uploaded_file_path, whisper_progress)
+                        asyncio.to_thread(transcribe_local_video_file, uploaded_file_path, whisper_progress, expected_video_lang)
                     )
-                    while not task.done():
-                        try:
-                            evt = await asyncio.wait_for(progress_queue.get(), timeout=0.2)
-                            yield _sse(evt)
-                        except asyncio.TimeoutError:
-                            pass
+                    try:
+                        while not task.done():
+                            try:
+                                evt = await asyncio.wait_for(progress_queue.get(), timeout=0.2)
+                                yield _sse(evt)
+                            except asyncio.TimeoutError:
+                                pass
 
-                    while not progress_queue.empty():
-                        yield _sse(progress_queue.get_nowait())
+                        while not progress_queue.empty():
+                            yield _sse(progress_queue.get_nowait())
 
-                    transcript_lines = await task
+                        transcript_lines = await task
+                    finally:
+                        if task and not task.done():
+                            task.cancel()
+                        elif task and not task.cancelled():
+                            try:
+                                task.exception()
+                            except (asyncio.CancelledError, Exception):
+                                pass
                     if not transcript_lines:
                         if is_mock:
                             transcript_lines = [
@@ -347,13 +531,24 @@ async def analyze_video(request: AnalyzeRequest):
                             })
                             return
 
+                    check_up = validate_transcript_language(transcript_lines, title=title)
+                    if not check_up['is_supported']:
+                        yield _sse({
+                            "error": (
+                                f"Video ini terdeteksi menggunakan percakapan dalam bahasa {check_up['name']}. "
+                                "Cheat Clip Pro difokuskan khusus untuk video dalam Bahasa Indonesia dan Bahasa Inggris saja."
+                            ),
+                            "status": 400
+                        })
+                        return
+
                     yield _sse({
                         "step": 3,
                         "step_progress": 100,
                         "overall_progress": 70,
                         "stage": "Dialogue Transcribed",
-                        "detail": f"Whisper speech-to-text complete — {len(transcript_lines)} timestamped dialogue sentences ready.",
-                        "message": f"Whisper transcribed {len(transcript_lines)} dialogue segments successfully."
+                        "detail": f"Whisper speech-to-text complete ({check_up['name']}) — {len(transcript_lines)} timestamped dialogue sentences ready.",
+                        "message": f"Whisper transcribed {len(transcript_lines)} dialogue segments successfully ({check_up['name']})."
                     })
                 except Exception as e:
                     if is_mock:
@@ -388,14 +583,29 @@ async def analyze_video(request: AnalyzeRequest):
             })
 
             channel = ""
+            expected_video_lang = None
+            req_lang = (request.transcript_language or "").lower().strip()
+            if req_lang in ("id", "in"):
+                expected_video_lang = "id"
+            elif req_lang == "en":
+                expected_video_lang = "en"
+
             try:
-                metadata = await asyncio.to_thread(fetch_video_metadata, canonical_url, request.proxy)
+                metadata = await asyncio.to_thread(fetch_video_metadata, canonical_url, request.proxy, request.cookies)
                 title    = metadata["title"]
                 channel  = metadata.get("channel", "")
                 duration = metadata["duration"]
                 heatmap  = metadata.get("heatmap") or []
                 is_live  = metadata.get("is_live", False)
                 live_status = metadata.get("live_status", "not_live")
+                
+                # If transcript_language was not explicitly provided by request, infer from metadata
+                if not expected_video_lang:
+                    audio_lang_raw = (metadata.get("audio_language") or "").lower().strip()
+                    if audio_lang_raw in ("id", "in"):
+                        expected_video_lang = "id"
+                    elif audio_lang_raw == "en":
+                        expected_video_lang = "en"
                 yield _sse({
                     "step": 1,
                     "step_progress": 100,
@@ -469,13 +679,27 @@ async def analyze_video(request: AnalyzeRequest):
                     transcript_lines = parse_manual_subtitles(request.subtitles, duration)
                     if not transcript_lines:
                         raise Exception("Custom subtitles parsed into empty array.")
+                    check_man = validate_transcript_language(transcript_lines, expected_video_lang=None, title=title)
+                    if not check_man['is_supported']:
+                        yield _sse({
+                            "error": f"Bahasa subtitle tidak didukung: terdeteksi {check_man['name']}. Cheat Clip Pro hanya memproses bahasa Indonesia dan Inggris.",
+                            "status": 400
+                        })
+                        return
+                    if check_man['mismatch_detected']:
+                        yield _sse({
+                            "error": check_man['error_message'],
+                            "status": 400
+                        })
+                        return
+
                     yield _sse({
                         "step": 3,
                         "step_progress": 100,
                         "overall_progress": 70,
                         "stage": "Subtitles Ready",
-                        "detail": f"Custom subtitles parsed — {len(transcript_lines)} timestamped lines loaded.",
-                        "message": f"Custom subtitles parsed — {len(transcript_lines)} lines loaded successfully."
+                        "detail": f"Custom subtitles parsed — {len(transcript_lines)} timestamped lines loaded ({check_man['name']}).",
+                        "message": f"Custom subtitles parsed — {len(transcript_lines)} lines loaded successfully ({check_man['name']})."
                     })
                 except Exception as e:
                     yield _sse({"error": f"Failed to parse manual subtitles: {str(e)}", "status": 400})
@@ -516,7 +740,7 @@ async def analyze_video(request: AnalyzeRequest):
 
                 try:
                     task = asyncio.create_task(
-                        asyncio.to_thread(fetch_transcript, video_id, request.proxy, progress_callback)
+                        asyncio.to_thread(fetch_transcript, video_id, request.proxy, progress_callback, request.cookies, expected_video_lang)
                     )
 
                     while not task.done():
@@ -530,13 +754,20 @@ async def analyze_video(request: AnalyzeRequest):
                         yield _sse(progress_queue.get_nowait())
 
                     transcript_lines = await task
+                    # Validate that fetched transcript is strictly ID or EN and matches authentic spoken audio
+                    val = validate_transcript_language(transcript_lines, expected_video_lang=expected_video_lang, title=title)
+                    if not val['is_supported'] or val['mismatch_detected']:
+                        logger.warning(f"Fetched YouTube transcript rejected by language validator: {val.get('error_message')}. Discarding to trigger Whisper AI fallback...")
+                        transcript_lines = []
+                        raise Exception(f"Transcript language validation rejected: {val.get('error_message')}")
+
                     yield _sse({
                         "step": 3,
                         "step_progress": 100,
                         "overall_progress": 70,
                         "stage": "Subtitles Ready",
-                        "detail": f"Subtitles loaded — {len(transcript_lines)} dialogue sentences with timestamps ready.",
-                        "message": f"Subtitles loaded — {len(transcript_lines)} lines parsed successfully."
+                        "detail": f"Subtitles loaded ({val['name']}) — {len(transcript_lines)} dialogue sentences with timestamps ready.",
+                        "message": f"Subtitles loaded ({val['name']}) — {len(transcript_lines)} lines parsed successfully."
                     })
                 except Exception as e:
                     if is_mock:
@@ -559,21 +790,150 @@ async def analyze_video(request: AnalyzeRequest):
                             "detail": "Mock mode — 9 sample dialogue lines loaded.",
                             "message": "Mock mode — using sample transcript."
                         })
+                    elif is_live or live_status in ('is_live', 'is_upcoming', 'post_live'):
+                        yield _sse({
+                            "error": (
+                                "No subtitles could be retrieved because this video is currently live, "
+                                "upcoming, or recently completed (post-live processing). Subtitles are only "
+                                "available once the live stream ends and YouTube finishes processing the video. "
+                                "You can upload custom subtitles manually to analyze this video."
+                            ),
+                            "status": 400
+                        })
+                        return
                     else:
-                        if is_live or live_status in ('is_live', 'is_upcoming', 'post_live'):
+                        # ── Automatic Whisper AI Neural Speech Recognition Fallback ───
+                        logger.info(f"Direct subtitles unavailable for {video_id}. Attempting automatic Whisper AI speech transcription fallback...")
+                        yield _sse({
+                            "step": 3,
+                            "step_progress": 35,
+                            "overall_progress": 56,
+                            "stage": "AI Speech Fallback",
+                            "detail": "Direct YouTube subtitles restricted (Bot check / No CC). Downloading audio track & transcribing with Whisper AI...",
+                            "message": "Direct subtitles restricted — downloading audio & running Whisper AI..."
+                        })
+
+                        audio_path = None
+                        try:
+                            whisper_audio_queue = asyncio.Queue()
+                            def audio_dl_progress(stage: str, detail: str, step_pct: int = 40):
+                                loop.call_soon_threadsafe(whisper_audio_queue.put_nowait, {
+                                    "step": 3,
+                                    "step_progress": step_pct,
+                                    "overall_progress": min(62, 54 + int(step_pct * 0.12)),
+                                    "stage": stage,
+                                    "detail": detail,
+                                    "message": detail
+                                })
+
+                            audio_dl_task = asyncio.create_task(
+                                asyncio.to_thread(download_youtube_audio_file, video_id, None, request.proxy, request.cookies, audio_dl_progress)
+                            )
+                            while not audio_dl_task.done():
+                                try:
+                                    evt = await asyncio.wait_for(whisper_audio_queue.get(), timeout=0.2)
+                                    yield _sse(evt)
+                                except asyncio.TimeoutError:
+                                    pass
+                            while not whisper_audio_queue.empty():
+                                yield _sse(whisper_audio_queue.get_nowait())
+
+                            audio_path = await audio_dl_task
+                        except Exception as dl_err:
+                            logger.warning(f"Audio download for Whisper failed: {dl_err}")
+
+                        if audio_path and Path(audio_path).exists():
                             yield _sse({
-                                "error": (
-                                    "No subtitles could be retrieved because this video is currently live, "
-                                    "upcoming, or recently completed (post-live processing). Subtitles are only "
-                                    "available once the live stream ends and YouTube finishes processing the video. "
-                                    "You can upload custom subtitles manually to analyze this video."
-                                ),
-                                "status": 400
+                                "step": 3,
+                                "step_progress": 60,
+                                "overall_progress": 60,
+                                "stage": "Transcribing with Whisper",
+                                "detail": "Running OpenAI Whisper neural speech model on video audio track...",
+                                "message": "Transcribing dialogue with Whisper AI..."
                             })
+
+                            whisper_trans_queue = asyncio.Queue()
+                            def whisper_trans_progress(stage: str, detail: str, step_pct: int = 50):
+                                loop.call_soon_threadsafe(whisper_trans_queue.put_nowait, {
+                                    "step": 3,
+                                    "step_progress": step_pct,
+                                    "overall_progress": min(68, 58 + int(step_pct * 0.12)),
+                                    "stage": stage,
+                                    "detail": detail,
+                                    "message": detail
+                                })
+
+                            try:
+                                w_task = asyncio.create_task(
+                                    asyncio.to_thread(transcribe_local_video_file, audio_path, whisper_trans_progress, expected_video_lang)
+                                )
+                                try:
+                                    while not w_task.done():
+                                        try:
+                                            evt = await asyncio.wait_for(whisper_trans_queue.get(), timeout=0.2)
+                                            yield _sse(evt)
+                                        except asyncio.TimeoutError:
+                                            pass
+                                    while not whisper_trans_queue.empty():
+                                        yield _sse(whisper_trans_queue.get_nowait())
+
+                                    transcript_lines = await w_task
+                                finally:
+                                    if w_task and not w_task.done():
+                                        w_task.cancel()
+                                    elif w_task and not w_task.cancelled():
+                                        try:
+                                            w_task.exception()
+                                        except (asyncio.CancelledError, Exception):
+                                            pass
+                            except Exception as w_err:
+                                logger.warning(f"Whisper transcription failed: {w_err}")
+                                transcript_lines = []
+
+                            if transcript_lines:
+                                w_check = validate_transcript_language(transcript_lines, expected_video_lang=expected_video_lang, title=title)
+                                if not w_check['is_supported']:
+                                    yield _sse({
+                                        "error": (
+                                            f"Audio video ini terdeteksi menggunakan percakapan dalam bahasa {w_check['name']}. "
+                                            "Cheat Clip Pro difokuskan khusus untuk video dalam Bahasa Indonesia dan Bahasa Inggris saja."
+                                        ),
+                                        "status": 400
+                                    })
+                                    return
+
+                                if duration <= 0.0:
+                                    try:
+                                        audio_meta = await asyncio.to_thread(get_video_file_metadata, audio_path)
+                                        duration = float(audio_meta.get("duration") or 0.0)
+                                    except Exception:
+                                        pass
+                                    if duration <= 0.0 and transcript_lines:
+                                        last = transcript_lines[-1]
+                                        duration = float(last.get("start", 0.0) + last.get("duration", 0.0))
+
+                                if (not heatmap or len(heatmap) == 0) and duration > 0.0:
+                                    try:
+                                        heatmap = await asyncio.to_thread(compute_audio_energy_heatmap, audio_path, duration)
+                                    except Exception as hm_err:
+                                        logger.warning(f"Heatmap calculation from audio failed: {hm_err}")
+
+                                yield _sse({
+                                    "step": 3,
+                                    "step_progress": 100,
+                                    "overall_progress": 70,
+                                    "stage": "Subtitles Ready",
+                                    "detail": f"Whisper speech-to-text complete ({w_check['name']}) — {len(transcript_lines)} dialogue sentences with timestamps ready.",
+                                    "message": f"Whisper transcribed {len(transcript_lines)} lines parsed successfully ({w_check['name']})."
+                                })
+                            else:
+                                msg = e.detail if isinstance(e, HTTPException) else str(e)
+                                yield _sse({"error": f"Speech transcription failed: {msg}", "status": 400})
+                                return
                         else:
                             msg = e.detail if isinstance(e, HTTPException) else str(e)
                             yield _sse({"error": msg, "status": 400})
-                        return
+                            return
 
         # Estimate duration from transcript if missing
         if duration == 0.0 and transcript_lines:
@@ -725,17 +1085,44 @@ async def analyze_video(request: AnalyzeRequest):
                 f"Identify the highest-quality, most viral segments within this range."
             )
         else:
-            clip_range = "up to around 200 (AI-determined based on interesting topics)"
+            if duration <= 300:
+                auto_clip_target = "3-5"
+            elif duration <= 900:
+                auto_clip_target = "5-10"
+            elif duration <= 1800:
+                auto_clip_target = "8-15"
+            elif duration <= 3600:
+                auto_clip_target = "10-20"
+            else:
+                auto_clip_target = "15-25"
+
+            clip_range = f"{auto_clip_target} clips (AI-selected based on viral potential)"
             clip_count_instruction = (
-                "DYNAMIC AUTO CLIP COUNT & TOPIC CURATION RULES:\n"
-                "- You (the AI editor) decide the total number of clips to extract based on how many genuinely interesting, high-value, and viral topics exist in this video.\n"
-                "- Upper Constraint Ceiling: Extract up to around 200 clips maximum (no need to reach exactly 200; extract as many as the video's content genuinely justifies, up to approximately 200 clips).\n"
-                "- High-Interest Standalone Topics Required: Every single clip MUST focus on an interesting, distinct, and compelling topic, idea, debate, story, funny moment, or revelation. Do NOT produce repetitive, weak, or trivial filler clips just to inflate the count. Only create clips for moments that would actually captivate an audience."
+                f"DYNAMIC AUTO CLIP COUNT & TOPIC CURATION RULES:\n"
+                f"- Extract approximately {auto_clip_target} high-impact, standalone viral clips based on the most captivating moments in this video.\n"
+                f"- High-Interest Standalone Topics Required: Every single clip MUST focus on an interesting, distinct, and compelling topic, idea, debate, story, funny moment, or revelation. Do NOT produce repetitive, weak, or trivial filler clips."
             )
 
         # ── Step 4: Build prompt & Detect Language ─────────────────────────────
         detected_lang = detect_transcript_language(enriched_transcript, title)
+        if not detected_lang.get('is_supported', True):
+            yield _sse({
+                "error": (
+                    f"Transkrip video terdeteksi dalam bahasa {detected_lang.get('name')}. "
+                    "Cheat Clip Pro difokuskan khusus untuk video dalam Bahasa Indonesia dan Bahasa Inggris saja."
+                ),
+                "status": 400
+            })
+            return
+
         lang_code = detected_lang.get('code', 'en')
+        if lang_code not in ('id', 'en'):
+            yield _sse({
+                "error": f"Bahasa transkrip ({lang_code}) tidak valid. Cheat Clip Pro hanya memproses bahasa Indonesia dan Inggris.",
+                "status": 400
+            })
+            return
+
         lang_name = detected_lang.get('name', 'English')
         logger.info(f"Detected video language: {lang_name} ({lang_code}) - confidence {detected_lang.get('confidence', 0.0)}")
 
@@ -744,7 +1131,7 @@ async def analyze_video(request: AnalyzeRequest):
             eng = f"|{line['engagement']:.2f}" if heatmap and line['engagement'] > 0 else ""
             transcript_dump.append(f"{line['start']:.1f}|{line['end']:.1f}{eng} {line['text']}")
 
-        MAX_LINES = 8000 if is_long_video else 4000
+        MAX_LINES = 3500 if is_long_video else 2000
         if len(transcript_dump) > MAX_LINES:
             logger.warning(f"Transcript {len(transcript_dump)} lines — truncating to {MAX_LINES}.")
             transcript_dump = transcript_dump[:MAX_LINES]
@@ -753,17 +1140,32 @@ async def analyze_video(request: AnalyzeRequest):
 
         is_auto_duration = str(request.duration).lower() == "auto"
         if is_auto_duration:
-            dur_range = "Auto dynamic length (~15s to ~90s max)"
+            dur_range = "Auto dynamic length (~20s to ~90s max)"
+            min_target_duration = 18.0
+            max_target_duration = 90.0
             duration_instruction = (
                 "DYNAMIC AUTO CLIP DURATION GUIDELINES:\n"
-                "- Intelligently adjust the duration of each individual clip based on its natural narrative flow and context so that NO CONTEXT, setup, premise, punchline, or explanation is cut off mid-thought.\n"
-                "- Generate variant clip durations naturally: ranging flexibly from approximately 15 seconds up to around 90 seconds (1 minute 30 seconds maximum). Do NOT force all clips to be the same length (some can be ~20-30s, some ~40-60s, and deeper discussions or complex stories can be up to around 90s).\n"
+                "- STRICT MINIMUM DURATION: Every clip MUST be at least 18-20 seconds long. NEVER create micro-clips of 2, 3, 5, or 8 seconds! A 3-second clip is completely useless as a standalone Short/Reel/TikTok.\n"
+                "- Intelligently adjust the duration of each individual clip based on its natural narrative flow and context so that the setup, premise, context, punchline, and resolution are fully included.\n"
+                "- Generate variant clip durations naturally: ranging flexibly from approximately 20 seconds up to around 90 seconds (1 minute 30 seconds maximum). Do NOT force all clips to be the exact same length (some can be ~25-35s, some ~45-60s, and deeper discussions or stories up to around 90s).\n"
                 "- Strict maximum constraint: No clip should ever exceed 90 seconds (1 minute 30 seconds). Always ensure clips begin and end cleanly at complete sentence boundaries without mid-word or mid-sentence cuts."
             )
         else:
-            dur_target = {"15s": "10-20s", "30s": "20-40s", "60s": "45-75s"}.get(request.duration, "20-40s")
-            dur_range = dur_target
-            duration_instruction = f"Target clip length: {dur_target}. Keep clips tightly focused around this duration."
+            duration_presets = {
+                "15s": {"target": "14-22s", "min": 12.0, "max": 25.0},
+                "30s": {"target": "25-42s", "min": 20.0, "max": 48.0},
+                "60s": {"target": "48-75s", "min": 40.0, "max": 85.0}
+            }
+            preset_info = duration_presets.get(str(request.duration), {"target": "25-42s", "min": 20.0, "max": 48.0})
+            dur_range = preset_info["target"]
+            min_target_duration = preset_info["min"]
+            max_target_duration = preset_info["max"]
+            duration_instruction = (
+                f"STRICT CLIP DURATION REQUIREMENTS (Target: {preset_info['target']}):\n"
+                f"- ABSOLUTE MINIMUM DURATION: No clip may be shorter than {int(min_target_duration)} seconds! NEVER return tiny snippets or 3-second soundbites.\n"
+                f"- Include sufficient context: Ensure every clip contains the full setup, premise, conversation/gameplay context, and conclusion so it functions as a complete, engaging standalone video.\n"
+                f"- Target duration range: {preset_info['target']}. Keep the clip length strictly around this window."
+            )
 
         heatmap_note = (
             "Columns: start|end|audience_interest(0-1). Prioritise high-interest peaks."
@@ -804,7 +1206,8 @@ async def analyze_video(request: AnalyzeRequest):
             f"YOU MUST GENERATE 100% OF ALL CONTENT STRICTLY AND EXCLUSIVELY IN {lang_name.upper()}.\n\n"
             f"1. NEVER TRANSLATE TO ANY OTHER LANGUAGE!\n"
             f"   - If the video is in English -> ALL titles, title suggestions, summaries, captions, hashtags, and quotes MUST BE 100% IN ENGLISH. Do NOT write Indonesian, Spanish, or any other language!\n"
-            f"   - If the video is in Indonesian -> ALL titles, title suggestions, summaries, captions, hashtags, and quotes MUST BE 100% IN INDONESIAN. Do NOT write English or any other language!\n"
+            f"   - If the video is in Indonesian -> ALL titles, title suggestions, summaries, captions, hashtags, and quotes MUST BE 100% IN INDONESIAN. Do NOT write English, Arabic, or any other language!\n"
+            f"   - CRITICAL GUARD FOR INDONESIAN VIDEOS: If speakers use occasional Arabic loanwords or Islamic greetings/phrases (e.g., 'Assalamu\'alaikum', 'Bismillah', 'Alhamdulillah', 'Insya Allah', or Arabic quotes), DO NOT TRANSLATE INTO ARABIC! The video language is 100% BAHASA INDONESIA. All titles, suggestions, and captions MUST be written strictly in BAHASA INDONESIA.\n"
             f"   - If the video is in another language -> ALL output MUST strictly match that language.\n"
             f"   - Even if the user's prompt or search query was written in another language, your output MUST REMAIN 100% IN {lang_name.upper()}.\n"
             f"2. Strict field requirements in {lang_name.upper()}:\n"
@@ -847,209 +1250,321 @@ async def analyze_video(request: AnalyzeRequest):
             "message": f"Verified language: {lang_name}. Zero-translation rule enforced for {requested_model}."
         })
 
-        # ── Step 4: Gemini API call with dynamic Flash fallback models and retry ───────────
-        client = genai.Client(api_key=gemini_key)
-        
-        # Discover all available Flash models for the user's API key
-        discovered_flash = await asyncio.to_thread(get_flash_models_for_key, client)
-        
-        # Build models_to_try:
-        # 1. Start with the requested model
-        # 2. Append all discovered and known flash models in version descending order (e.g. 3.7, 3.6, 3.5, 2.5, 2.0, 1.5)
-        models_to_try = [requested_model]
-        for fm in discovered_flash:
-            if fm not in models_to_try:
-                models_to_try.append(fm)
-        for km in KNOWN_FLASH_MODELS:
-            if km not in models_to_try:
-                models_to_try.append(km)
-
-        logger.info(f"Flash fallback chain prepared: {models_to_try}")
-
+        # ── Step 4: AI Model API call (Gemini or OpenRouter) with dynamic fallback and retry ───
         response = None
         last_error = None
         encountered_quota_error = None
         analysis_data = None
         successful_model = None
 
-        for idx, model_name in enumerate(models_to_try):
-            next_model_hint = models_to_try[idx + 1] if idx + 1 < len(models_to_try) else None
-            MAX_RETRIES = 2
-            
-            for attempt in range(MAX_RETRIES):
-                if attempt > 0:
-                    wait = 2
-                    yield _sse({
-                        "step": 4,
-                        "step_progress": 25,
-                        "overall_progress": 75,
-                        "stage": "Transient Retry",
-                        "detail": f"{model_name} busy — waiting {wait}s before retry ({attempt + 1}/{MAX_RETRIES})...",
-                        "model": model_name,
-                        "message": f"{model_name} is busy — waiting {wait}s before retry {attempt + 1}/{MAX_RETRIES}..."
-                    })
-                    await asyncio.sleep(wait)
-                
-                yield _sse({
-                    "step": 4,
-                    "step_progress": 18,
-                    "overall_progress": 74,
-                    "stage": "Neural Model Dispatch",
-                    "detail": f"Dispatched {len(transcript_dump)} lines to {model_name} (attempt {attempt + 1})...",
-                    "model": model_name,
-                    "message": f"Calling {model_name} (attempt {attempt + 1}/{MAX_RETRIES})..."
-                })
-                
-                # Execute Gemini call with heartbeat to keep mobile connection alive and show live stages
-                task = asyncio.create_task(asyncio.to_thread(
-                    client.models.generate_content,
-                    model=model_name,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=VideoAnalysis,
-                        temperature=0.2,
-                        max_output_tokens=65536 if any(v in model_name for v in ['2.0', '2.5', '3.']) else 8192,
-                    )
-                ))
-                
-                call_start = asyncio.get_event_loop().time()
-                while not task.done():
-                    done, _ = await asyncio.wait([task], timeout=2.0)
-                    if not done:
-                        elapsed = int(asyncio.get_event_loop().time() - call_start)
-                        
-                        if elapsed < 5:
-                            stage = "Neural Context Loading"
-                            detail = f"Transmitting {len(transcript_dump)} timestamped dialogue segments to {model_name}..."
-                            step_prog = min(35, 12 + elapsed * 4)
-                        elif elapsed < 12:
-                            stage = "Retention Spike Cross-Analysis"
-                            detail = f"Correlating viewer retention peaks against speaker dialogue to isolate viral moments..."
-                            step_prog = min(55, 35 + int((elapsed - 5) * 3))
-                        elif elapsed < 20:
-                            stage = "Viral Hook & Curiosity Detection"
-                            detail = f"Scanning transcript dialogue for opening hooks, punchlines, controversial takes & emotional peaks..."
-                            step_prog = min(72, 55 + int((elapsed - 12) * 2.2))
-                        elif elapsed < 30:
-                            stage = "Coherence & Sentence Boundary Snapping"
-                            detail = f"Ensuring clip candidates start and end naturally on sentence boundaries without mid-word cuts..."
-                            step_prog = min(85, 72 + int((elapsed - 20) * 1.3))
-                        elif elapsed < 42:
-                            stage = "Virality Scoring & Selection"
-                            display_clip_count = "all high-value" if is_auto_clip_count else f"the top {clip_range}"
-                            detail = f"Calculating virality coefficients (1-100) and selecting {display_clip_count} highest potential clips..."
-                            step_prog = min(92, 85 + int((elapsed - 30) * 0.7))
-                        else:
-                            stage = "Social Media Metadata Synthesis"
-                            detail = f"Drafting attention-grabbing titles, social captions, and targeted hashtags ({elapsed}s)..."
-                            step_prog = min(95, 92 + min(3, int((elapsed - 42) * 0.3)))
+        if api_provider == "openrouter":
+            req_open_model = (request.openrouter_model or request.model or "google/gemini-2.5-flash").strip()
+            models_to_try = get_openrouter_fallback_chain(req_open_model)
+            logger.info(f"OpenRouter model chain for {req_open_model}: {models_to_try}")
 
-                        overall_prog = 70 + int(step_prog * 0.28)
+            for idx, model_name in enumerate(models_to_try):
+                next_model_hint = models_to_try[idx + 1] if idx + 1 < len(models_to_try) else None
+                MAX_RETRIES = 1
+                MODEL_TIMEOUT_SEC = 120.0
+
+                for attempt in range(MAX_RETRIES):
+                    if attempt > 0:
+                        wait = 2
                         yield _sse({
                             "step": 4,
-                            "keepalive": True,
-                            "step_progress": step_prog,
-                            "overall_progress": overall_prog,
-                            "stage": stage,
-                            "detail": detail,
+                            "step_progress": 25,
+                            "overall_progress": 75,
+                            "stage": "Transient Retry",
+                            "detail": f"{model_name} busy — waiting {wait}s before retry...",
                             "model": model_name,
-                            "elapsed": elapsed,
-                            "message": f"[{model_name} | {elapsed}s] {stage}: {detail}"
+                            "message": f"{model_name} busy — waiting {wait}s before retry..."
                         })
-                
-                try:
-                    resp_candidate = await task
-                    last_error = None
-                    
-                    # Parse structured response
-                    parsed_data = None
-                    if hasattr(resp_candidate, 'parsed') and resp_candidate.parsed is not None:
-                        parsed = resp_candidate.parsed
-                        parsed_data = {
-                            "summary": getattr(parsed, 'summary', ''),
-                            "clips": [
-                                {
-                                    "title": sanitize_first_person_title(getattr(c, 'title', ''), channel, lang=lang_code),
-                                    "start_time": getattr(c, 'start_time', 0.0),
-                                    "end_time": getattr(c, 'end_time', 0.0),
-                                    "hook_time": getattr(c, 'hook_time', None),
-                                    "virality_score": getattr(c, 'virality_score', 0),
-                                    "key_quotes": getattr(c, 'key_quotes', []),
-                                    "title_suggestion": sanitize_first_person_title(getattr(c, 'title_suggestion', ''), channel, lang=lang_code),
-                                    "caption_suggestion": getattr(c, 'caption_suggestion', ''),
-                                    "hashtag_suggestion": getattr(c, 'hashtag_suggestion', ''),
-                                }
-                                for c in (getattr(parsed, 'clips', []) or [])
-                            ]
-                        }
-                    elif resp_candidate.text:
-                        raw_text = resp_candidate.text.strip()
-                        if raw_text.startswith("```"):
-                            raw_text = re.sub(r"^```[a-zA-Z]*\n?", "", raw_text)
-                            raw_text = re.sub(r"\n?```$", "", raw_text)
-                        try:
-                            parsed_data = json.loads(raw_text)
-                        except Exception as json_err:
-                            logger.warning(f"JSON parsing error from {model_name}: {json_err}")
-                            parsed_data = None
+                        await asyncio.sleep(wait)
 
-                    if parsed_data is not None:
-                        clips_found = len(parsed_data.get('clips', []))
-                        if clips_found == 0 and next_model_hint is not None:
-                            logger.warning(f"{model_name} returned 0 clips. Will try next flash model {next_model_hint}...")
+                    yield _sse({
+                        "step": 4,
+                        "step_progress": 18,
+                        "overall_progress": 74,
+                        "stage": "OpenRouter Neural Dispatch",
+                        "detail": f"Dispatched {len(transcript_dump)} lines to {model_name} via OpenRouter...",
+                        "model": model_name,
+                        "message": f"Calling OpenRouter model {model_name}..."
+                    })
+
+                    task = asyncio.create_task(analyze_with_openrouter(
+                        api_key=openrouter_key,
+                        model_name=model_name,
+                        prompt=prompt,
+                        timeout=MODEL_TIMEOUT_SEC
+                    ))
+
+                    call_start = asyncio.get_event_loop().time()
+                    timed_out = False
+                    while not task.done():
+                        done, _ = await asyncio.wait([task], timeout=1.5)
+                        if not done:
+                            elapsed = int(asyncio.get_event_loop().time() - call_start)
+                            if elapsed >= MODEL_TIMEOUT_SEC:
+                                logger.warning(f"OpenRouter {model_name} exceeded {MODEL_TIMEOUT_SEC}s timeout.")
+                                task.cancel()
+                                timed_out = True
+                                last_error = TimeoutError(f"{model_name} inference timed out after {MODEL_TIMEOUT_SEC}s")
+                                break
+
+                            step_prog = min(96, 20 + int(elapsed * 1.5))
+                            overall_prog = 70 + int(step_prog * 0.28)
                             yield _sse({
                                 "step": 4,
-                                "step_progress": 40,
-                                "overall_progress": 78,
-                                "stage": "Flash Model Fallback",
-                                "detail": f"{model_name} returned 0 clips — switching to {next_model_hint} for deeper extraction...",
-                                "model": next_model_hint,
-                                "message": f"{model_name} returned 0 clips — switching to {next_model_hint}..."
+                                "keepalive": True,
+                                "step_progress": step_prog,
+                                "overall_progress": overall_prog,
+                                "stage": "AI Retention & Virality Synthesis",
+                                "detail": f"Analyzing video transcript moments using OpenRouter {model_name} ({elapsed}s)...",
+                                "model": model_name,
+                                "elapsed": elapsed,
+                                "message": f"[{model_name} | {elapsed}s] Analyzing moments..."
                             })
-                            last_error = Exception(f"{model_name} returned 0 clips")
-                            break
-                        
-                        response = resp_candidate
-                        analysis_data = parsed_data
-                        successful_model = model_name
-                        break
-                    else:
-                        last_error = Exception(f"{model_name} returned empty or unparseable response")
-                        break
-                        
-                except Exception as e:
-                    last_error = e
-                    err_str = str(e).lower()
-                    logger.warning(f"Error from {model_name} (attempt {attempt + 1}): {e}")
-                    
-                    if any(x in err_str for x in ('429', 'quota', 'resource exhausted', 'rate limit')):
-                        encountered_quota_error = e
+
+                    if timed_out:
                         break
 
-                    if any(x in err_str for x in ('404', 'not found', 'not supported')):
+                    try:
+                        validated_res = await task
+                        analysis_data = validated_res.model_dump()
+                        successful_model = model_name
+                        logger.info(f"OpenRouter analysis succeeded using {successful_model} with {len(analysis_data.get('clips', []))} clips.")
+                        break
+                    except Exception as e:
+                        last_error = e
+                        logger.warning(f"Error from OpenRouter {model_name}: {e}")
+                        err_str = str(e).lower()
+                        if any(x in err_str for x in ('429', 'quota', 'credit', 'rate limit', 'balance')):
+                            encountered_quota_error = e
+                        break
+
+                if analysis_data:
+                    break
+                elif next_model_hint:
+                    yield _sse({
+                        "step": 4,
+                        "step_progress": 35,
+                        "overall_progress": 76,
+                        "stage": "OpenRouter Model Fallback",
+                        "detail": f"{model_name} issue — switching to {next_model_hint} within same family...",
+                        "model": next_model_hint,
+                        "message": f"Switching to OpenRouter fallback model {next_model_hint}..."
+                    })
+
+            if analysis_data is None:
+                err_report = str(encountered_quota_error or last_error or "OpenRouter analysis failed.")
+                yield _sse({
+                    "error": f"OpenRouter Error: {err_report}",
+                    "status": 500
+                })
+                return
+        else:
+            client = genai.Client(api_key=gemini_key, http_options=types.HttpOptions(timeout=120000))
+            
+            # Discover all available Flash models for the user's API key
+            discovered_flash = await asyncio.to_thread(get_flash_models_for_key, client)
+            
+            # Build models_to_try (capped at top 4 to prevent prolonged delays):
+            models_to_try = [requested_model]
+            for fm in discovered_flash:
+                if fm not in models_to_try:
+                    models_to_try.append(fm)
+            for km in KNOWN_FLASH_MODELS:
+                if km not in models_to_try:
+                    models_to_try.append(km)
+
+            models_to_try = models_to_try[:4]
+            logger.info(f"Flash fallback chain prepared: {models_to_try}")
+
+            for idx, model_name in enumerate(models_to_try):
+                next_model_hint = models_to_try[idx + 1] if idx + 1 < len(models_to_try) else None
+                MAX_RETRIES = 1
+                MODEL_TIMEOUT_SEC = 120.0  # 120s best-practice timeout for comprehensive video analysis
+                
+                for attempt in range(MAX_RETRIES):
+                    if attempt > 0:
+                        wait = 2
+                        yield _sse({
+                            "step": 4,
+                            "step_progress": 25,
+                            "overall_progress": 75,
+                            "stage": "Transient Retry",
+                            "detail": f"{model_name} busy — waiting {wait}s before retry ({attempt + 1}/{MAX_RETRIES})...",
+                            "model": model_name,
+                            "message": f"{model_name} is busy — waiting {wait}s before retry {attempt + 1}/{MAX_RETRIES}..."
+                        })
+                        await asyncio.sleep(wait)
+                    
+                    yield _sse({
+                        "step": 4,
+                        "step_progress": 18,
+                        "overall_progress": 74,
+                        "stage": "Neural Model Dispatch",
+                        "detail": f"Dispatched {len(transcript_dump)} lines to {model_name}...",
+                        "model": model_name,
+                        "message": f"Calling {model_name} (attempt {attempt + 1}/{MAX_RETRIES})..."
+                    })
+                    
+                    # Execute Gemini call with heartbeat and balanced timeout
+                    task = asyncio.create_task(asyncio.to_thread(
+                        client.models.generate_content,
+                        model=model_name,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            response_schema=VideoAnalysis,
+                            temperature=0.2,
+                            max_output_tokens=65536,
+                        )
+                    ))
+                    
+                    call_start = asyncio.get_event_loop().time()
+                    timed_out = False
+                    while not task.done():
+                        done, _ = await asyncio.wait([task], timeout=1.5)
+                        if not done:
+                            elapsed = int(asyncio.get_event_loop().time() - call_start)
+                            if elapsed >= MODEL_TIMEOUT_SEC:
+                                logger.warning(f"Model {model_name} exceeded {MODEL_TIMEOUT_SEC}s timeout. Cancelling task to fallback...")
+                                task.cancel()
+                                timed_out = True
+                                last_error = TimeoutError(f"{model_name} inference timed out after {MODEL_TIMEOUT_SEC}s")
+                                break
+                            
+                            if elapsed < 8:
+                                stage = "Neural Context Loading"
+                                detail = f"Transmitting {len(transcript_dump)} timestamped dialogue segments to {model_name}..."
+                                step_prog = min(35, 12 + int(elapsed * 2.8))
+                            elif elapsed < 20:
+                                stage = "Retention Spike Cross-Analysis"
+                                detail = f"Correlating viewer retention peaks against speaker dialogue to isolate viral moments..."
+                                step_prog = min(55, 35 + int((elapsed - 8) * 1.6))
+                            elif elapsed < 40:
+                                stage = "Viral Hook & Curiosity Detection"
+                                detail = f"Scanning transcript dialogue for opening hooks, punchlines, controversial takes & emotional peaks..."
+                                step_prog = min(75, 55 + int((elapsed - 20) * 1.0))
+                            elif elapsed < 65:
+                                stage = "Coherence & Sentence Boundary Snapping"
+                                detail = f"Ensuring clip candidates start and end naturally on sentence boundaries without mid-word cuts..."
+                                step_prog = min(88, 75 + int((elapsed - 40) * 0.5))
+                            elif elapsed < 90:
+                                stage = "Virality Scoring & Selection"
+                                display_clip_count = "all high-value" if is_auto_clip_count else f"the top {clip_range}"
+                                detail = f"Calculating virality coefficients (1-100) and selecting {display_clip_count} highest potential clips..."
+                                step_prog = min(94, 88 + int((elapsed - 65) * 0.24))
+                            else:
+                                stage = "Social Media Metadata Synthesis"
+                                detail = f"Drafting attention-grabbing titles, social captions, and targeted hashtags ({elapsed}s)..."
+                                step_prog = min(96, 94 + min(2, int((elapsed - 90) * 0.07)))
+
+                            overall_prog = 70 + int(step_prog * 0.28)
+                            yield _sse({
+                                "step": 4,
+                                "keepalive": True,
+                                "step_progress": step_prog,
+                                "overall_progress": overall_prog,
+                                "stage": stage,
+                                "detail": detail,
+                                "model": model_name,
+                                "elapsed": elapsed,
+                                "message": f"[{model_name} | {elapsed}s] {stage}: {detail}"
+                            })
+                    
+                    if timed_out:
                         break
                     
-                    is_server_busy = any(x in err_str for x in ('503', 'unavailable', 'overloaded', '500', 'internal'))
-                    if not is_server_busy:
-                        break
-            
-            if analysis_data is not None and response is not None:
-                break
+                    try:
+                        resp_candidate = await task
+                        last_error = None
+                        
+                        # Parse structured response
+                        parsed_data = None
+                        if hasattr(resp_candidate, 'parsed') and resp_candidate.parsed is not None:
+                            parsed = resp_candidate.parsed
+                            raw_clips = getattr(parsed, 'clips', []) or []
+                            if raw_clips:
+                                parsed_data = {
+                                    "summary": getattr(parsed, 'summary', ''),
+                                    "clips": [
+                                        {
+                                            "title": sanitize_first_person_title(getattr(c, 'title', ''), channel, lang=lang_code),
+                                            "start_time": getattr(c, 'start_time', 0.0),
+                                            "end_time": getattr(c, 'end_time', 0.0),
+                                            "hook_time": getattr(c, 'hook_time', None),
+                                            "virality_score": getattr(c, 'virality_score', 0),
+                                            "key_quotes": getattr(c, 'key_quotes', []),
+                                            "title_suggestion": sanitize_first_person_title(getattr(c, 'title_suggestion', ''), channel, lang=lang_code),
+                                            "caption_suggestion": getattr(c, 'caption_suggestion', ''),
+                                            "hashtag_suggestion": getattr(c, 'hashtag_suggestion', ''),
+                                        }
+                                        for c in raw_clips
+                                    ]
+                                }
+                        
+                        # Lenient fallback parser (repairs truncated/unescaped JSON from text)
+                        if parsed_data is None and hasattr(resp_candidate, 'text') and resp_candidate.text:
+                            parsed_data = parse_lenient_json_analysis(resp_candidate.text, channel, lang_code)
+
+                        if parsed_data is not None:
+                            clips_found = len(parsed_data.get('clips', []))
+                            if clips_found == 0 and next_model_hint is not None:
+                                logger.warning(f"{model_name} returned 0 clips. Will try next flash model {next_model_hint}...")
+                                yield _sse({
+                                    "step": 4,
+                                    "step_progress": 40,
+                                    "overall_progress": 78,
+                                    "stage": "Flash Model Fallback",
+                                    "detail": f"{model_name} returned 0 clips — switching to {next_model_hint} for deeper extraction...",
+                                    "model": next_model_hint,
+                                    "message": f"{model_name} returned 0 clips — switching to {next_model_hint}..."
+                                })
+                                last_error = Exception(f"{model_name} returned 0 clips")
+                                break
+                            
+                            response = resp_candidate
+                            analysis_data = parsed_data
+                            successful_model = model_name
+                            break
+                        else:
+                            last_error = Exception(f"{model_name} returned empty or unparseable response")
+                            break
+                            
+                    except Exception as e:
+                        last_error = e
+                        err_str = str(e).lower()
+                        logger.warning(f"Error from {model_name} (attempt {attempt + 1}): {e}")
+                        
+                        if any(x in err_str for x in ('429', 'quota', 'resource exhausted', 'rate limit')):
+                            encountered_quota_error = e
+                            break
+
+                        if any(x in err_str for x in ('404', 'not found', 'not supported')):
+                            break
+                        
+                        is_server_busy = any(x in err_str for x in ('503', 'unavailable', 'overloaded', '500', 'internal'))
+                        if not is_server_busy:
+                            break
                 
-            if next_model_hint is not None:
-                err_summary = "quota reached" if any(x in str(last_error).lower() for x in ('429', 'quota', 'rate limit')) else \
-                              "not available or deprecated" if "404" in str(last_error) else \
-                              "temporarily busy"
-                yield _sse({
-                    "step": 4,
-                    "step_progress": 35,
-                    "overall_progress": 76,
-                    "stage": "Flash Fallback",
-                    "detail": f"{model_name} {err_summary} — switching to fallback {next_model_hint}...",
-                    "model": next_model_hint,
-                    "message": f"{model_name} {err_summary} — switching to flash fallback model {next_model_hint}..."
-                })
+                if analysis_data is not None and response is not None:
+                    break
+                    
+                if next_model_hint is not None:
+                    err_summary = "quota reached" if any(x in str(last_error).lower() for x in ('429', 'quota', 'rate limit')) else \
+                                  "not available or deprecated" if "404" in str(last_error) else \
+                                  "temporarily busy"
+                    yield _sse({
+                        "step": 4,
+                        "step_progress": 35,
+                        "overall_progress": 76,
+                        "stage": "Flash Fallback",
+                        "detail": f"{model_name} {err_summary} — switching to fallback {next_model_hint}...",
+                        "model": next_model_hint,
+                        "message": f"{model_name} {err_summary} — switching to flash fallback model {next_model_hint}..."
+                    })
 
         if analysis_data is None:
             # If any model in the fallback chain suffered quota exhaustion, prioritize showing the quota explanation
@@ -1149,18 +1664,6 @@ async def analyze_video(request: AnalyzeRequest):
                         "caption_suggestion": f"Momen terbaik dari video: {preview} #viral #trending",
                         "hashtag_suggestion": "#viral #shorts #trending"
                     })
-                elif lang_code == 'es':
-                    fallback_clips_list.append({
-                        "title": f"Momento Destacado #{i+1}",
-                        "start_time": st,
-                        "end_time": et,
-                        "hook_time": st,
-                        "virality_score": max(70, int(95 - i * 5)),
-                        "key_quotes": [seg_text[:80]] if seg_text else [],
-                        "title_suggestion": f"Momento Imperdible #{i+1}",
-                        "caption_suggestion": f"Momento clave del video: {preview} #viral #trending",
-                        "hashtag_suggestion": "#viral #shorts #trending"
-                    })
                 else:
                     fallback_clips_list.append({
                         "title": f"Key Highlight #{i+1}",
@@ -1177,8 +1680,6 @@ async def analyze_video(request: AnalyzeRequest):
             if not analysis_data.get('summary'):
                 if lang_code == 'id':
                     analysis_data['summary'] = f"Analisis video \"{title}\" menemukan {len(fallback_clips_list)} segmen cuplikan pilihan. #viral #highlights"
-                elif lang_code == 'es':
-                    analysis_data['summary'] = f"Análisis de \"{title}\" identificando {len(fallback_clips_list)} segmentos clave. #viral #highlights"
                 else:
                     analysis_data['summary'] = f"Analysis of \"{title}\" identifying {len(fallback_clips_list)} key segments. #viral #highlights"
 
@@ -1203,15 +1704,50 @@ async def analyze_video(request: AnalyzeRequest):
             if hook is None or not (start <= hook <= end):
                 hook = start
             
-            # Enforce max 90 seconds (1m 30s) duration constraint for auto duration mode
-            if is_auto_duration and (end - start) > 90.0:
-                max_end = start + 90.0
+            # Enforce max duration constraint (e.g. 90s max for auto)
+            if (end - start) > max_target_duration:
+                max_end = start + max_target_duration
                 best_end = max_end
                 for l in enriched_transcript:
-                    l_end = l.get('end', 0.0)
-                    if start + 15.0 <= l_end <= max_end:
+                    l_end = float(l.get('end', 0.0))
+                    if start + min_target_duration <= l_end <= max_end:
                         best_end = l_end
                 end = best_end
+
+            # Enforce minimum duration constraint: expand micro-clips (e.g. 3s, 5s) to at least min_target_duration
+            clip_dur = end - start
+            if clip_dur < min_target_duration:
+                deficit = min_target_duration - clip_dur
+                expand_backward = deficit / 2.0
+                expand_forward = deficit / 2.0
+                
+                # Check video start/end boundaries
+                new_start = max(start_bound, start - expand_backward)
+                new_end = min(end_bound, end + expand_forward)
+
+                # Snap new_start backward to previous sentence/dialogue line start if available
+                matching_starts = [
+                    float(l.get('start', 0.0)) for l in enriched_transcript
+                    if start_bound <= float(l.get('start', 0.0)) <= new_start + 1.5
+                ]
+                if matching_starts:
+                    new_start = min(matching_starts, key=lambda s_val: abs(s_val - new_start))
+
+                # Snap new_end forward to subsequent sentence/dialogue line end if available
+                matching_ends = [
+                    float(l.get('end', 0.0)) for l in enriched_transcript
+                    if new_end - 1.5 <= float(l.get('end', 0.0)) <= end_bound
+                ]
+                if matching_ends:
+                    new_end = min(matching_ends, key=lambda e_val: abs(e_val - new_end))
+
+                # Ensure minimum length is satisfied
+                if (new_end - new_start) >= min_target_duration or (new_end - new_start) > clip_dur:
+                    start = round(new_start, 2)
+                    end = round(new_end, 2)
+
+            if hook is None or not (start <= hook <= end):
+                hook = start
             
             clip_lines = [
                 line.get("text", "")

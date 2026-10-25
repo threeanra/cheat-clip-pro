@@ -1,6 +1,25 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
+import { 
+  AlertTriangle, 
+  RefreshCw, 
+  Copy, 
+  Check, 
+  RotateCcw, 
+  Trash2, 
+  ArrowLeft, 
+  ArrowRight, 
+  X,
+  Music,
+  FileCode,
+  Play,
+  Pause
+} from 'lucide-react';
 import { useLanguage } from '../locales';
 import { resilientFetch } from '../utils/api';
+import { getStoredCookies, hasStoredCookies } from '../utils/cookieUtils';
+import { detectFaceClientSide } from '../utils/clientFaceDetector';
+import { isMobileDevice } from '../utils/deviceUtils';
+import { isWebCodecsGpuSupported, getClientGpuName } from '../services/webcodecsRenderer';
 import type {
   ViralClip,
   RenderSettings,
@@ -18,6 +37,7 @@ import type {
   BatchRenderProgress,
   HardwareAccelOption,
   HardwareAccelInfo,
+  FontItem,
 } from '../types';
 
 interface ClipStudioSectionProps {
@@ -33,25 +53,31 @@ interface ClipStudioSectionProps {
   batchProgress?: BatchRenderProgress | null;
   onDismissProgress?: () => void;
   onRetryClip?: (clipIndex?: number) => void;
+  allowAppUpdates?: boolean;
+  onOpenCookiesModal?: () => void;
+  onBackToClips?: () => void;
 }
 
 function getFriendlyErrorMessage(rawMsg: string): string {
   if (!rawMsg) return 'Rendering failed unexpectedly.';
   const lower = rawMsg.toLowerCase();
   if (lower.includes("moov atom not found")) {
-    return 'Download interrupted by internet lag ("moov atom not found"). The video stream was cut off before finishing. Click "🔄 Retry" to re-download.';
+    return 'Download interrupted by internet lag ("moov atom not found"). The video stream was cut off before finishing. Click "[~] Retry" to re-download.';
   }
   if (lower.includes("bot verification") || lower.includes("sign in") || lower.includes("confirm you're not a bot")) {
-    return 'YouTube requires cookies verification. Click the 🍪 Cookies Manager button in the top navbar to save your YouTube cookies.';
+    return 'YouTube requires cookies verification. Click the [*] Cookies Manager button in the top navbar to save your YouTube cookies.';
+  }
+  if (lower.includes("rendering timed out") || (lower.includes("timed out") && lower.includes("rendering"))) {
+    return 'Video rendering timed out due to duration/complexity. Click "[~] Retry" or switch to Universal CPU encoder in Studio Settings.';
   }
   if (lower.includes("timed out") || lower.includes("timeout")) {
-    return 'Video download timed out due to slow/laggy internet connection. Click "🔄 Retry" to try downloading again.';
+    return 'Video download timed out due to slow/laggy internet connection. Click "[~] Retry" to try downloading again.';
   }
   if (lower.includes("hardware encoder") || (lower.includes("ffmpeg") && (lower.includes("nvenc") || lower.includes("amf") || lower.includes("qsv")))) {
     return 'GPU hardware encoder failed. Please switch Video Encoder to "Universal CPU (libx264)" in Studio Settings.';
   }
   if (lower.includes("no space left") || lower.includes("disk full") || lower.includes("out of disk")) {
-    return 'Disk storage is full. Please click "🧹 Clear Temp" to free up storage space.';
+    return 'Disk storage is full. Please click "[x] Clear Temp" to free up storage space.';
   }
   if (lower.includes("whisper") || lower.includes("transcribe")) {
     return 'Word transcription failed. Check your audio track or switch subtitle style to none.';
@@ -79,9 +105,9 @@ const ClipRenderErrorBox: React.FC<{ errorMessage: string; t: any; onRetry?: () 
       style={{
         marginTop: '0.4rem',
         padding: '0.55rem 0.75rem',
-        background: 'rgba(239, 68, 68, 0.08)',
-        border: '1px solid rgba(239, 68, 68, 0.28)',
-        borderRadius: '7px',
+        background: 'rgba(255, 30, 39, 0.12)',
+        border: '1px solid #ff1e27',
+        borderRadius: 0,
         fontSize: '0.72rem',
         color: '#fca5a5',
         display: 'flex',
@@ -89,12 +115,13 @@ const ClipRenderErrorBox: React.FC<{ errorMessage: string; t: any; onRetry?: () 
         gap: '0.35rem',
         lineHeight: 1.4,
         wordBreak: 'break-word',
+        boxShadow: '0 0 10px rgba(255, 30, 39, 0.25)'
       }}
     >
       <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '0.6rem' }}>
         <div style={{ display: 'flex', alignItems: 'flex-start', gap: '0.4rem' }}>
-          <span style={{ fontSize: '0.9rem', flexShrink: 0 }}>⚠️</span>
-          <span style={{ fontWeight: 600, color: '#fca5a5' }}>{friendly}</span>
+          <AlertTriangle size={15} color="#ff1e27" style={{ flexShrink: 0, marginTop: '1px' }} />
+          <span style={{ fontWeight: 700, color: '#fff' }}>{friendly}</span>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', flexShrink: 0 }}>
           {onRetry && (
@@ -107,7 +134,7 @@ const ClipRenderErrorBox: React.FC<{ errorMessage: string; t: any; onRetry?: () 
               style={{
                 background: 'linear-gradient(135deg, #f59e0b, #d97706)',
                 border: '1px solid rgba(245, 158, 11, 0.6)',
-                borderRadius: '4px',
+                borderRadius: 0,
                 color: '#ffffff',
                 fontSize: '0.65rem',
                 padding: '2px 8px',
@@ -115,10 +142,14 @@ const ClipRenderErrorBox: React.FC<{ errorMessage: string; t: any; onRetry?: () 
                 fontWeight: 700,
                 transition: 'all 0.2s ease',
                 boxShadow: '0 0 8px rgba(245, 158, 11, 0.35)',
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '0.25rem'
               }}
               title="Retry rendering this clip"
             >
-              {t.studio.retryClipBtn || '🔄 Retry'}
+              <RefreshCw size={11} />
+              {t.studio.retryClipBtn || 'Retry'}
             </button>
           )}
           <button
@@ -127,17 +158,21 @@ const ClipRenderErrorBox: React.FC<{ errorMessage: string; t: any; onRetry?: () 
             style={{
               background: copied ? 'rgba(16, 185, 129, 0.2)' : 'rgba(255, 255, 255, 0.08)',
               border: `1px solid ${copied ? 'rgba(16, 185, 129, 0.4)' : 'rgba(255, 255, 255, 0.15)'}`,
-              borderRadius: '4px',
+              borderRadius: 0,
               color: copied ? '#34d399' : '#e2e8f0',
               fontSize: '0.65rem',
               padding: '2px 7px',
               cursor: 'pointer',
               fontWeight: 600,
               transition: 'all 0.2s ease',
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '0.25rem'
             }}
             title="Copy full error details"
           >
-            {copied ? (t.studio.copiedErrorBtn || '✓ Copied!') : (t.studio.copyErrorBtn || '📋 Copy')}
+            {copied ? <Check size={11} /> : <Copy size={11} />}
+            {copied ? (t.studio.copiedErrorBtn || 'Copied!') : (t.studio.copyErrorBtn || 'Copy')}
           </button>
         </div>
       </div>
@@ -168,6 +203,85 @@ const ClipRenderErrorBox: React.FC<{ errorMessage: string; t: any; onRetry?: () 
   );
 };
 
+export const STUDIO_PREFS_KEY = 'cheat_clip_studio_preferences';
+
+export interface StudioPreferences {
+  aspectRatio?: AspectRatioOption;
+  backgroundStyle?: BackgroundStyle;
+  enableFaceTracking?: boolean;
+  streamerPreset?: StreamerPreset;
+  facecamPosition?: FacecamPosition;
+  titlePosition?: TitlePosition;
+  captionStyle?: CaptionStyle;
+  captionFont?: CaptionFont;
+  titleFont?: CaptionFont;
+  fontSize?: FontSizeOption;
+  fontSizePx?: number;
+  titleFontSize?: FontSizeOption;
+  titleFontSizePx?: number;
+  textCase?: TextCaseOption;
+  titleTextCase?: TextCaseOption;
+  subtitlePositionMode?: SubtitlePositionMode;
+  titleDuration?: TitleDurationOption;
+  originalAudioVolume?: number;
+  hardwareAccel?: HardwareAccelOption;
+  titleYPercent?: number;
+  subtitleYPercent?: number;
+  subtitleCenterYPercent?: number;
+  isCustomTitleY?: boolean;
+  bgmVolume?: number;
+  hookSfxVolume?: number;
+  renderMode?: 'separate' | 'merged';
+  fileNamePrefix?: string;
+  fileNameSuffix?: string;
+  titlePrefix?: string;
+  titleSuffix?: string;
+}
+
+export const DEFAULT_STUDIO_PREFS: Required<StudioPreferences> = {
+  aspectRatio: '9:16',
+  backgroundStyle: 'black',
+  enableFaceTracking: true,
+  streamerPreset: 'none',
+  facecamPosition: 'auto',
+  titlePosition: 'auto',
+  captionStyle: 'viral_pop',
+  captionFont: 'Outfit',
+  titleFont: 'Outfit',
+  fontSize: 'medium',
+  fontSizePx: 75,
+  titleFontSize: 'medium',
+  titleFontSizePx: 75,
+  textCase: 'uppercase',
+  titleTextCase: 'uppercase',
+  subtitlePositionMode: 'bottom',
+  titleDuration: 'entire',
+  originalAudioVolume: 100,
+  hardwareAccel: 'browser_wasm',
+  titleYPercent: 17,
+  subtitleYPercent: 21,
+  subtitleCenterYPercent: 50,
+  isCustomTitleY: false,
+  bgmVolume: 25,
+  hookSfxVolume: 100,
+  renderMode: 'separate',
+  fileNamePrefix: '',
+  fileNameSuffix: '',
+  titlePrefix: '',
+  titleSuffix: '',
+};
+
+function getSavedStudioPreferences(): Partial<StudioPreferences> {
+  try {
+    const raw = localStorage.getItem(STUDIO_PREFS_KEY);
+    if (!raw) return {};
+    return JSON.parse(raw) as Partial<StudioPreferences>;
+  } catch (e) {
+    console.warn('Failed to parse studio preferences from localStorage:', e);
+    return {};
+  }
+}
+
 export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
   videoUrl,
   videoId,
@@ -181,50 +295,94 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
   batchProgress,
   onDismissProgress,
   onRetryClip,
+  allowAppUpdates = false,
+  onOpenCookiesModal,
+  onBackToClips,
 }) => {
   const { t } = useLanguage();
+  const isYouTube = !videoId?.startsWith('upload_') && !videoId?.startsWith('gdrive_') && !videoUrl?.includes('/api/video');
+  const [hasCookies, setHasCookies] = useState<boolean>(() => hasStoredCookies());
+
+  useEffect(() => {
+    const handleCookieChange = () => setHasCookies(hasStoredCookies());
+    window.addEventListener('storage', handleCookieChange);
+    window.addEventListener('cheatclip_cookies_updated', handleCookieChange);
+    return () => {
+      window.removeEventListener('storage', handleCookieChange);
+      window.removeEventListener('cheatclip_cookies_updated', handleCookieChange);
+    };
+  }, []);
+
   // Directly reflect marked clips (supports selecting 0 clips)
   const [selectedClips, setSelectedClips] = useState<ViralClip[]>(markedClips);
   const [previewClipIndex, setPreviewClipIndex] = useState<number>(0);
 
-  const [aspectRatio, setAspectRatio] = useState<AspectRatioOption>('9:16');
-  const [backgroundStyle, setBackgroundStyle] = useState<BackgroundStyle>('black');
-  const [enableFaceTracking, setEnableFaceTracking] = useState<boolean>(true);
-  const [streamerPreset, setStreamerPreset] = useState<StreamerPreset>('none');
-  const [facecamPosition, setFacecamPosition] = useState<FacecamPosition>('auto');
-  const [titlePrefix, setTitlePrefix] = useState<string>('');
-  const [titleSuffix, setTitleSuffix] = useState<string>('');
+  const [aspectRatio, setAspectRatio] = useState<AspectRatioOption>(() => getSavedStudioPreferences().aspectRatio ?? DEFAULT_STUDIO_PREFS.aspectRatio);
+  const [backgroundStyle, setBackgroundStyle] = useState<BackgroundStyle>(() => getSavedStudioPreferences().backgroundStyle ?? DEFAULT_STUDIO_PREFS.backgroundStyle);
+  const [enableFaceTracking, setEnableFaceTracking] = useState<boolean>(() => getSavedStudioPreferences().enableFaceTracking ?? DEFAULT_STUDIO_PREFS.enableFaceTracking);
+  const [streamerPreset, setStreamerPreset] = useState<StreamerPreset>(() => getSavedStudioPreferences().streamerPreset ?? DEFAULT_STUDIO_PREFS.streamerPreset);
+  const [facecamPosition, setFacecamPosition] = useState<FacecamPosition>(() => getSavedStudioPreferences().facecamPosition ?? DEFAULT_STUDIO_PREFS.facecamPosition);
+  const [titlePrefix, setTitlePrefix] = useState<string>(() => getSavedStudioPreferences().titlePrefix ?? DEFAULT_STUDIO_PREFS.titlePrefix);
+  const [titleSuffix, setTitleSuffix] = useState<string>(() => getSavedStudioPreferences().titleSuffix ?? DEFAULT_STUDIO_PREFS.titleSuffix);
   const [customClipTitles, setCustomClipTitles] = useState<Record<string, string>>({});
-  const [titlePosition, setTitlePosition] = useState<TitlePosition>('auto');
-  const [captionStyle, setCaptionStyle] = useState<CaptionStyle>('viral_pop');
-  const [lastActiveCaptionStyle, setLastActiveCaptionStyle] = useState<CaptionStyle>('viral_pop');
-  const [captionFont, setCaptionFont] = useState<CaptionFont>('Outfit');
-  const [fontSize, setFontSize] = useState<FontSizeOption>('medium');
-  const [titleFontSize, setTitleFontSize] = useState<FontSizeOption>('medium');
-  const [textCase, setTextCase] = useState<TextCaseOption>('uppercase');
-  const [fileNamePrefix, setFileNamePrefix] = useState<string>('');
-  const [fileNameSuffix, setFileNameSuffix] = useState<string>('');
+  const [titlePosition, setTitlePosition] = useState<TitlePosition>(() => getSavedStudioPreferences().titlePosition ?? DEFAULT_STUDIO_PREFS.titlePosition);
+  const [captionStyle, setCaptionStyle] = useState<CaptionStyle>(() => getSavedStudioPreferences().captionStyle ?? DEFAULT_STUDIO_PREFS.captionStyle);
+  const [lastActiveCaptionStyle, setLastActiveCaptionStyle] = useState<CaptionStyle>(() => {
+    const cap = getSavedStudioPreferences().captionStyle ?? DEFAULT_STUDIO_PREFS.captionStyle;
+    return cap !== 'none' ? cap : 'viral_pop';
+  });
+  const [captionFont, setCaptionFont] = useState<CaptionFont>(() => getSavedStudioPreferences().captionFont ?? DEFAULT_STUDIO_PREFS.captionFont);
+  const [titleFont, setTitleFont] = useState<CaptionFont>(() => getSavedStudioPreferences().titleFont ?? DEFAULT_STUDIO_PREFS.titleFont);
+  const [fontSize, setFontSize] = useState<FontSizeOption>(() => getSavedStudioPreferences().fontSize ?? DEFAULT_STUDIO_PREFS.fontSize);
+  const [fontSizePx, setFontSizePx] = useState<number>(() => getSavedStudioPreferences().fontSizePx ?? DEFAULT_STUDIO_PREFS.fontSizePx);
+  const [titleFontSize, setTitleFontSize] = useState<FontSizeOption>(() => getSavedStudioPreferences().titleFontSize ?? DEFAULT_STUDIO_PREFS.titleFontSize);
+  const [titleFontSizePx, setTitleFontSizePx] = useState<number>(() => getSavedStudioPreferences().titleFontSizePx ?? DEFAULT_STUDIO_PREFS.titleFontSizePx);
+  const [textCase, setTextCase] = useState<TextCaseOption>(() => getSavedStudioPreferences().textCase ?? DEFAULT_STUDIO_PREFS.textCase);
+  const [titleTextCase, setTitleTextCase] = useState<TextCaseOption>(() => getSavedStudioPreferences().titleTextCase ?? DEFAULT_STUDIO_PREFS.titleTextCase);
+
+  // Multi-Segment Merged Render Mode
+  const [renderMode, setRenderMode] = useState<'separate' | 'merged'>(() => getSavedStudioPreferences().renderMode ?? DEFAULT_STUDIO_PREFS.renderMode);
+  const [compilationTitle, setCompilationTitle] = useState<string>('');
+
+  // Custom Font Library State
+  const [availableFonts, setAvailableFonts] = useState<FontItem[]>([
+    { name: 'Outfit', is_custom: false },
+    { name: 'Montserrat', is_custom: false },
+    { name: 'Inter', is_custom: false },
+    { name: 'Impact', is_custom: false },
+    { name: 'Bebas Neue', is_custom: false },
+    { name: 'Anton', is_custom: false },
+    { name: 'Poppins', is_custom: false },
+    { name: 'Arial Black', is_custom: false },
+  ]);
+  const [isUploadingFont, setIsUploadingFont] = useState<boolean>(false);
+  const [isTitleFontDragging, setIsTitleFontDragging] = useState<boolean>(false);
+  const [isSubFontDragging, setIsSubFontDragging] = useState<boolean>(false);
+  const titleFontInputRef = useRef<HTMLInputElement | null>(null);
+  const subtitleFontInputRef = useRef<HTMLInputElement | null>(null);
+  const [fileNamePrefix, setFileNamePrefix] = useState<string>(() => getSavedStudioPreferences().fileNamePrefix ?? DEFAULT_STUDIO_PREFS.fileNamePrefix);
+  const [fileNameSuffix, setFileNameSuffix] = useState<string>(() => getSavedStudioPreferences().fileNameSuffix ?? DEFAULT_STUDIO_PREFS.fileNameSuffix);
 
   // Manual Up/Down positioning for All Formats
-  const [titleYPercent, setTitleYPercent] = useState<number>(17);
-  const [subtitleYPercent, setSubtitleYPercent] = useState<number>(21);
-  const [subtitlePositionMode, setSubtitlePositionMode] = useState<SubtitlePositionMode>('bottom');
-  const [subtitleCenterYPercent, setSubtitleCenterYPercent] = useState<number>(50);
-  const [isCustomTitleY, setIsCustomTitleY] = useState<boolean>(false);
-  const [titleDuration, setTitleDuration] = useState<TitleDurationOption>('entire');
+  const [titleYPercent, setTitleYPercent] = useState<number>(() => getSavedStudioPreferences().titleYPercent ?? DEFAULT_STUDIO_PREFS.titleYPercent);
+  const [subtitleYPercent, setSubtitleYPercent] = useState<number>(() => getSavedStudioPreferences().subtitleYPercent ?? DEFAULT_STUDIO_PREFS.subtitleYPercent);
+  const [subtitlePositionMode, setSubtitlePositionMode] = useState<SubtitlePositionMode>(() => getSavedStudioPreferences().subtitlePositionMode ?? DEFAULT_STUDIO_PREFS.subtitlePositionMode);
+  const [subtitleCenterYPercent, setSubtitleCenterYPercent] = useState<number>(() => getSavedStudioPreferences().subtitleCenterYPercent ?? DEFAULT_STUDIO_PREFS.subtitleCenterYPercent);
+  const [isCustomTitleY, setIsCustomTitleY] = useState<boolean>(() => getSavedStudioPreferences().isCustomTitleY ?? DEFAULT_STUDIO_PREFS.isCustomTitleY);
+  const [titleDuration, setTitleDuration] = useState<TitleDurationOption>(() => getSavedStudioPreferences().titleDuration ?? DEFAULT_STUDIO_PREFS.titleDuration);
   const [isClearingTemp, setIsClearingTemp] = useState<boolean>(false);
   const [tempClearMsg, setTempClearMsg] = useState<string>('');
   const [showClearConfirmModal, setShowClearConfirmModal] = useState<boolean>(false);
 
   // Original Voice Audio Boost (0% - 200%, default 100%)
-  const [originalAudioVolume, setOriginalAudioVolume] = useState<number>(100);
+  const [originalAudioVolume, setOriginalAudioVolume] = useState<number>(() => getSavedStudioPreferences().originalAudioVolume ?? DEFAULT_STUDIO_PREFS.originalAudioVolume);
 
   // Background Music (BGM) state
   const [bgmEnabled, setBgmEnabled] = useState<boolean>(false);
   const [bgmFileName, setBgmFileName] = useState<string>('');
   const [bgmFilePath, setBgmFilePath] = useState<string>('');
   const [bgmAudioUrl, setBgmAudioUrl] = useState<string>('');
-  const [bgmVolume, setBgmVolume] = useState<number>(25);
+  const [bgmVolume, setBgmVolume] = useState<number>(() => getSavedStudioPreferences().bgmVolume ?? DEFAULT_STUDIO_PREFS.bgmVolume);
   const [bgmDuration, setBgmDuration] = useState<number>(0);
   const [bgmStartOffset, setBgmStartOffset] = useState<number>(0);
   const [isBgmPlaying, setIsBgmPlaying] = useState<boolean>(false);
@@ -233,11 +391,10 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
   const bgmAudioRef = useRef<HTMLAudioElement | null>(null);
 
   // Hook Sound Effect (SFX) state
-  const [hookSfxEnabled, setHookSfxEnabled] = useState<boolean>(false);
   const [hookSfxFileName, setHookSfxFileName] = useState<string>('');
   const [hookSfxFilePath, setHookSfxFilePath] = useState<string>('');
   const [hookSfxAudioUrl, setHookSfxAudioUrl] = useState<string>('');
-  const [hookSfxVolume, setHookSfxVolume] = useState<number>(100);
+  const [hookSfxVolume, setHookSfxVolume] = useState<number>(() => getSavedStudioPreferences().hookSfxVolume ?? DEFAULT_STUDIO_PREFS.hookSfxVolume);
   const [isHookSfxPlaying, setIsHookSfxPlaying] = useState<boolean>(false);
   const [isUploadingHookSfx, setIsUploadingHookSfx] = useState<boolean>(false);
   const [isHookSfxDragging, setIsHookSfxDragging] = useState<boolean>(false);
@@ -258,9 +415,34 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
   const [isWatermarkDragging, setIsWatermarkDragging] = useState<boolean>(false);
   const phoneContainerRef = useRef<HTMLDivElement | null>(null);
 
-  // Hardware acceleration / Video Encoder state
-  const [hardwareAccel, setHardwareAccel] = useState<HardwareAccelOption>('auto');
+  const [isLocalhost] = useState<boolean>(() => {
+    if (typeof window !== 'undefined') {
+      const h = window.location.hostname;
+      return h === 'localhost' || h === '127.0.0.1';
+    }
+    return false;
+  });
+
+  const [clientGpuName, setClientGpuName] = useState<string>(() => getClientGpuName());
+  const [hasWebCodecs] = useState<boolean>(() => isWebCodecsGpuSupported());
+
+  // Hardware acceleration / Video Encoder state:
+  // - On Mobile: default to 'auto' (Server Render) to avoid mobile OOM / tab crashes.
+  // - On Desktop (deployed): default to 'client_gpu' / 'browser_wasm' to use user's local GPU/CPU and avoid burdening the server.
+  // - On Desktop (localhost): default to 'auto'.
+  const [hardwareAccel, setHardwareAccel] = useState<HardwareAccelOption>(() => {
+    if (isMobileDevice()) {
+      return 'auto';
+    }
+    const isLocal = typeof window !== 'undefined' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
+    if (!isLocal) {
+      return isWebCodecsGpuSupported() ? 'client_gpu' : 'browser_wasm';
+    }
+    const saved = getSavedStudioPreferences().hardwareAccel;
+    return (saved && saved !== 'browser_wasm') ? saved : 'auto';
+  });
   const [hardwareInfo, setHardwareInfo] = useState<HardwareAccelInfo | null>(null);
+  const [hwDropdownOpen, setHwDropdownOpen] = useState<boolean>(false);
 
   useEffect(() => {
     const fetchHardwareSupport = async () => {
@@ -269,13 +451,95 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
         if (res.ok) {
           const data: HardwareAccelInfo = await res.json();
           setHardwareInfo(data);
+          if (data.gpu_name) {
+            setClientGpuName(data.gpu_name);
+          }
         }
       } catch {
         // Backend offline or loading
       }
     };
+
+    if (isMobileDevice()) {
+      // Mobile devices always use Server Engine (FFmpeg) to prevent mobile browser crash / OOM
+      setHardwareAccel('auto');
+      fetchHardwareSupport();
+      return;
+    }
+
+    if (!isLocalhost) {
+      // On deployed domain for desktop users, use client engine (prefer client_gpu) to spare server
+      setHardwareAccel(isWebCodecsGpuSupported() ? 'client_gpu' : 'browser_wasm');
+      return;
+    }
     fetchHardwareSupport();
   }, []);
+
+  const loadCustomFontFace = (name: string, url: string) => {
+    try {
+      // Isolate custom font face name or specify descriptors so it does not overwrite global UI font definitions (e.g. 'Inter' 400)
+      const isSystemUiFont = ['inter', 'outfit', 'jetbrains mono', 'roboto', 'segoe ui'].includes(name.trim().toLowerCase());
+      const familyName = isSystemUiFont ? `Preview-${name}` : name;
+      const font = new FontFace(familyName, `url(${url})`);
+      font.load().then(loaded => {
+        (document.fonts as Set<FontFace>).add(loaded);
+      }).catch(err => console.warn(`Font '${name}' load error:`, err));
+    } catch (e) {
+      console.warn('FontFace API error:', e);
+    }
+  };
+
+  useEffect(() => {
+    const fetchAvailableFonts = async () => {
+      try {
+        const res = await resilientFetch('/api/fonts', { maxRetries: 3, retryDelay: 1000, silent: true });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.success && Array.isArray(data.fonts)) {
+            setAvailableFonts(data.fonts);
+            data.fonts.forEach((f: FontItem) => {
+              if (f.url) loadCustomFontFace(f.name, f.url);
+            });
+          }
+        }
+      } catch {
+        // Fallback to built-in fonts
+      }
+    };
+    fetchAvailableFonts();
+  }, []);
+
+  const handleUploadFont = async (file: File, target: 'title' | 'subtitle') => {
+    if (!file) return;
+    setIsUploadingFont(true);
+    const formData = new FormData();
+    formData.append('file', file);
+    try {
+      const res = await resilientFetch('/api/upload-font', {
+        method: 'POST',
+        body: formData,
+      });
+      const data = await res.json();
+      if (data.success && data.font_name) {
+        if (data.url) loadCustomFontFace(data.font_name, data.url);
+        setAvailableFonts(prev => {
+          if (!prev.some(f => f.name.toLowerCase() === data.font_name.toLowerCase())) {
+            return [...prev, { name: data.font_name, is_custom: true, filename: data.filename, url: data.url }];
+          }
+          return prev;
+        });
+        if (target === 'title') {
+          setTitleFont(data.font_name);
+        } else {
+          setCaptionFont(data.font_name);
+        }
+      }
+    } catch (err) {
+      console.error('Failed to upload custom font:', err);
+    } finally {
+      setIsUploadingFont(false);
+    }
+  };
 
   // Playable video player state
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
@@ -326,7 +590,18 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
     let isMounted = true;
     const fetchFace = async () => {
       try {
-        const res = await fetch(`/api/detect-face?video_id=${encodeURIComponent(videoId)}&timestamp=${clipStart}&video_url=${encodeURIComponent(videoUrl || '')}&facecam_position=${encodeURIComponent(facecamPosition)}&streamer_preset=${encodeURIComponent(streamerPreset)}`);
+        // For local uploaded files (blob: URL or upload_ ID), run client-side detection directly
+        if (videoUrl?.startsWith('blob:') || videoId.startsWith('upload_')) {
+          const clientBox = await detectFaceClientSide(directVideoRef.current, facecamPosition, streamerPreset);
+          if (clientBox && isMounted) {
+            setFaceBox(clientBox);
+            return;
+          }
+        }
+
+        const userCookies = getStoredCookies();
+        const cookiesParam = userCookies ? `&cookies=${encodeURIComponent(userCookies)}` : '';
+        const res = await fetch(`/api/detect-face?video_id=${encodeURIComponent(videoId)}&timestamp=${clipStart}&video_url=${encodeURIComponent(videoUrl || '')}&facecam_position=${encodeURIComponent(facecamPosition)}&streamer_preset=${encodeURIComponent(streamerPreset)}${cookiesParam}`);
         if (res.ok && isMounted) {
           const data = await res.json();
           if (data && typeof data.cx === 'number') {
@@ -645,6 +920,32 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
     }
   };
 
+  const handleMoveClipUp = (index: number) => {
+    if (index <= 0) return;
+    setSelectedClips(prev => {
+      const next = [...prev];
+      const temp = next[index - 1];
+      next[index - 1] = next[index];
+      next[index] = temp;
+      return next;
+    });
+  };
+
+  const handleMoveClipDown = (index: number) => {
+    if (index >= selectedClips.length - 1) return;
+    setSelectedClips(prev => {
+      const next = [...prev];
+      const temp = next[index + 1];
+      next[index + 1] = next[index];
+      next[index] = temp;
+      return next;
+    });
+  };
+
+  const totalSelectedDuration = useMemo(() => {
+    return Math.round(selectedClips.reduce((acc, c) => acc + (c.end_time - c.start_time), 0));
+  }, [selectedClips]);
+
   const handleClearTempClick = () => {
     setShowClearConfirmModal(true);
   };
@@ -771,7 +1072,6 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
       setHookSfxFileName(data.filename || file.name);
       setHookSfxFilePath(data.file_path);
       setHookSfxAudioUrl(data.url);
-      setHookSfxEnabled(true);
     } catch (err) {
       console.error('SFX upload error:', err);
       alert('Failed to upload sound effect file. Please try an MP3, WAV, or M4A file.');
@@ -791,7 +1091,6 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
       hookSfxAudioRef.current.pause();
     }
     setIsHookSfxPlaying(false);
-    setHookSfxEnabled(false);
     setHookSfxFileName('');
     setHookSfxFilePath('');
     setHookSfxAudioUrl('');
@@ -819,8 +1118,9 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
   const uploadWatermarkFile = async (file: File) => {
     if (!file) return;
     setIsUploadingWatermark(true);
+    let localUrl = '';
     try {
-      const localUrl = URL.createObjectURL(file);
+      localUrl = URL.createObjectURL(file);
       setWatermarkImageUrl(localUrl);
       setWatermarkImageFileName(file.name);
 
@@ -841,7 +1141,14 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
       setWatermarkEnabled(true);
     } catch (err) {
       console.error('Watermark upload error:', err);
-      alert('Failed to upload watermark image.');
+      const msg = err instanceof Error ? err.message : 'Failed to upload watermark image.';
+      alert(msg);
+      if (localUrl) {
+        try { URL.revokeObjectURL(localUrl); } catch { /* ignore */ }
+      }
+      setWatermarkImageFilePath('');
+      setWatermarkImageUrl('');
+      setWatermarkImageFileName('');
     } finally {
       setIsUploadingWatermark(false);
     }
@@ -1121,8 +1428,8 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
 
   // Preview framing dimensions (adapts dynamically for True Landscape vs Vertical)
   const isLandscape = aspectRatio === '16:9_landscape';
-  const phoneWidth = isLandscape ? 480 : 320;
-  const phoneHeight = isLandscape ? 270 : 569;
+  const phoneWidth = 320;
+  const phoneHeight = isLandscape ? 180 : 569;
 
   const currentClipKey = currentPreviewClip ? `${currentPreviewClip.start_time}_${currentPreviewClip.end_time}` : '';
   const currentCustomTitle = currentClipKey ? customClipTitles[currentClipKey] : undefined;
@@ -1140,7 +1447,7 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
 
   const { formatted: formattedTitle, lineCount: titleLineCount } = formatTitleSmart(
     activeTitle,
-    textCase,
+    titleTextCase,
     titleFontSize
   );
 
@@ -1181,6 +1488,119 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
     setSubtitleCenterYPercent(defaults.subCenterY);
   };
 
+  // Automatically persist studio customization preferences to localStorage
+  useEffect(() => {
+    const prefs: StudioPreferences = {
+      aspectRatio,
+      backgroundStyle,
+      enableFaceTracking,
+      streamerPreset,
+      facecamPosition,
+      titlePosition,
+      captionStyle,
+      captionFont,
+      titleFont,
+      fontSize,
+      fontSizePx,
+      titleFontSize,
+      titleFontSizePx,
+      textCase,
+      titleTextCase,
+      subtitlePositionMode,
+      titleDuration,
+      originalAudioVolume,
+      hardwareAccel,
+      titleYPercent,
+      subtitleYPercent,
+      subtitleCenterYPercent,
+      isCustomTitleY,
+      bgmVolume,
+      hookSfxVolume,
+      renderMode,
+      fileNamePrefix,
+      fileNameSuffix,
+      titlePrefix,
+      titleSuffix,
+    };
+    try {
+      localStorage.setItem(STUDIO_PREFS_KEY, JSON.stringify(prefs));
+    } catch (e) {
+      console.warn('Failed to persist studio preferences to localStorage:', e);
+    }
+  }, [
+    aspectRatio,
+    backgroundStyle,
+    enableFaceTracking,
+    streamerPreset,
+    facecamPosition,
+    titlePosition,
+    captionStyle,
+    captionFont,
+    titleFont,
+    fontSize,
+    fontSizePx,
+    titleFontSize,
+    titleFontSizePx,
+    textCase,
+    titleTextCase,
+    subtitlePositionMode,
+    titleDuration,
+    originalAudioVolume,
+    hardwareAccel,
+    titleYPercent,
+    subtitleYPercent,
+    subtitleCenterYPercent,
+    isCustomTitleY,
+    bgmVolume,
+    hookSfxVolume,
+    renderMode,
+    fileNamePrefix,
+    fileNameSuffix,
+    titlePrefix,
+    titleSuffix,
+  ]);
+
+  const handleResetToDefaults = () => {
+    setAspectRatio(DEFAULT_STUDIO_PREFS.aspectRatio);
+    setBackgroundStyle(DEFAULT_STUDIO_PREFS.backgroundStyle);
+    setEnableFaceTracking(DEFAULT_STUDIO_PREFS.enableFaceTracking);
+    setStreamerPreset(DEFAULT_STUDIO_PREFS.streamerPreset);
+    setFacecamPosition(DEFAULT_STUDIO_PREFS.facecamPosition);
+    setTitlePosition(DEFAULT_STUDIO_PREFS.titlePosition);
+    setCaptionStyle(DEFAULT_STUDIO_PREFS.captionStyle);
+    setLastActiveCaptionStyle(DEFAULT_STUDIO_PREFS.captionStyle);
+    setCaptionFont(DEFAULT_STUDIO_PREFS.captionFont);
+    setTitleFont(DEFAULT_STUDIO_PREFS.titleFont);
+    setFontSize(DEFAULT_STUDIO_PREFS.fontSize);
+    setFontSizePx(DEFAULT_STUDIO_PREFS.fontSizePx);
+    setTitleFontSize(DEFAULT_STUDIO_PREFS.titleFontSize);
+    setTitleFontSizePx(DEFAULT_STUDIO_PREFS.titleFontSizePx);
+    setTextCase(DEFAULT_STUDIO_PREFS.textCase);
+    setTitleTextCase(DEFAULT_STUDIO_PREFS.titleTextCase);
+    setSubtitlePositionMode(DEFAULT_STUDIO_PREFS.subtitlePositionMode);
+    setTitleDuration(DEFAULT_STUDIO_PREFS.titleDuration);
+    setOriginalAudioVolume(DEFAULT_STUDIO_PREFS.originalAudioVolume);
+    setHardwareAccel(DEFAULT_STUDIO_PREFS.hardwareAccel);
+    setTitleYPercent(DEFAULT_STUDIO_PREFS.titleYPercent);
+    setSubtitleYPercent(DEFAULT_STUDIO_PREFS.subtitleYPercent);
+    setSubtitleCenterYPercent(DEFAULT_STUDIO_PREFS.subtitleCenterYPercent);
+    setIsCustomTitleY(DEFAULT_STUDIO_PREFS.isCustomTitleY);
+    setBgmVolume(DEFAULT_STUDIO_PREFS.bgmVolume);
+    setHookSfxVolume(DEFAULT_STUDIO_PREFS.hookSfxVolume);
+    setRenderMode(DEFAULT_STUDIO_PREFS.renderMode);
+    setFileNamePrefix(DEFAULT_STUDIO_PREFS.fileNamePrefix);
+    setFileNameSuffix(DEFAULT_STUDIO_PREFS.fileNameSuffix);
+    setTitlePrefix(DEFAULT_STUDIO_PREFS.titlePrefix);
+    setTitleSuffix(DEFAULT_STUDIO_PREFS.titleSuffix);
+    handleResetTitlePosition();
+    handleResetSubtitlePosition();
+    try {
+      localStorage.removeItem(STUDIO_PREFS_KEY);
+    } catch (e) {
+      console.warn('Failed to clear studio preferences from localStorage:', e);
+    }
+  };
+
   const handleLaunch = () => {
     const enrichedSelectedClips = selectedClips.map(c => {
       const key = `${c.start_time}_${c.end_time}`;
@@ -1207,11 +1627,15 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
       fileNameSuffix,
       titlePosition,
       titleDuration,
+      titleFont,
       titleFontSize,
+      titleFontSizePx,
+      titleTextCase,
       subtitlesEnabled: captionStyle !== 'none',
       captionStyle,
       captionFont,
       fontSize,
+      fontSizePx,
       textCase,
       titleYPercent: safeTitleY,
       subtitleYPercent: safeSubtitleY,
@@ -1219,13 +1643,13 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
       subtitleCenterYPercent: safeSubCenterY,
       selectedClips: enrichedSelectedClips,
       // Background Music
-      bgmEnabled: bgmEnabled && !!bgmFilePath,
+      bgmEnabled: !!bgmFilePath,
       bgmFilePath,
       bgmFileName,
       bgmVolume,
       bgmStartOffset,
       // Hook SFX
-      hookSfxEnabled: hookSfxEnabled && !!hookSfxFilePath,
+      hookSfxEnabled: !!hookSfxFilePath,
       hookSfxFilePath,
       hookSfxFileName,
       hookSfxVolume,
@@ -1243,6 +1667,10 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
       originalAudioVolume,
       // Hardware Acceleration / Video Encoder
       hardwareAccel,
+      renderEngine: isMobileDevice() ? 'server' : (hardwareAccel === 'browser_wasm' ? 'client' : 'server'),
+      // Multi-Segment Merged Highlight Video
+      renderMode,
+      compilationTitle: compilationTitle.trim() || undefined,
     });
   };
 
@@ -1251,11 +1679,11 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
       {/* Fancy Glowing Section Header */}
       <div className="studio-section-header">
         <div className="studio-header-left">
-          <div className="studio-icon-glow">🎬</div>
           <div>
             <div className="studio-title-badge-row">
-              <h2 className="studio-main-heading">{t.studio.heading}</h2>
-              <span className="pro-badge glowing-badge">PRO</span>
+              <h2 className="studio-main-heading" style={{ fontSize: '1.4rem', fontFamily: 'var(--font-mono)', fontWeight: 800 }}>
+                <span style={{ color: '#ff00ff' }}>&gt;_</span> {t.studio.heading}
+              </h2>
             </div>
             <p className="studio-subtext">
               {t.studio.subtext}
@@ -1263,28 +1691,90 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
           </div>
         </div>
 
-        {/* Clip preview switcher */}
-        {allClips.length > 1 && (
-          <div className="preview-clip-picker-bar">
-            <span className="preview-picker-label">{t.studio.previewClip}</span>
-            <select
-              className="preview-clip-select"
-              value={previewClipIndex}
-              onChange={e => setPreviewClipIndex(Number(e.target.value))}
+        <div className="studio-header-actions" style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
+          {onBackToClips && (
+            <button
+              type="button"
+              onClick={onBackToClips}
+              className="glowing-btn"
+              style={{
+                padding: '0.45rem 1rem',
+                fontSize: '0.78rem',
+                fontWeight: 700,
+                fontFamily: 'var(--font-mono)',
+                background: 'rgba(255, 0, 255, 0.12)',
+                border: '1px solid #ff00ff',
+                color: '#ff00ff',
+                boxShadow: '0 0 10px rgba(255, 0, 255, 0.25)',
+                cursor: 'pointer',
+                borderRadius: 0,
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '0.4rem'
+              }}
             >
-              {allClips.map((clip, idx) => {
-                const clipKey = `${clip.start_time}_${clip.end_time}`;
-                const custom = customClipTitles[clipKey];
-                const displayT = (custom !== undefined && custom.trim()) ? custom.trim() : (clip.title_suggestion || clip.title);
-                return (
-                  <option key={idx} value={idx}>
-                    #{idx + 1}: {displayT} ({Math.round(clip.end_time - clip.start_time)}s)
-                  </option>
-                );
-              })}
-            </select>
-          </div>
-        )}
+              <ArrowLeft size={14} />
+              <span>02 {(t.studio as any).backToClips || 'KEMBALI KE CLIPS'}</span>
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={handleResetToDefaults}
+            className="studio-reset-defaults-btn"
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '0.4rem',
+              padding: '0.45rem 0.85rem',
+              borderRadius: 0,
+              fontSize: '0.78rem',
+              fontWeight: 700,
+              fontFamily: 'var(--font-mono)',
+              background: '#0d0d14',
+              border: '1px solid #272238',
+              color: 'var(--text-secondary)',
+              cursor: 'pointer',
+              transition: 'all 0.2s ease',
+            }}
+            onMouseEnter={e => {
+              e.currentTarget.style.color = '#ff1e27';
+              e.currentTarget.style.borderColor = '#ff1e27';
+              e.currentTarget.style.background = 'rgba(255, 30, 39, 0.1)';
+            }}
+            onMouseLeave={e => {
+              e.currentTarget.style.color = 'var(--text-secondary)';
+              e.currentTarget.style.borderColor = '#272238';
+              e.currentTarget.style.background = '#0d0d14';
+            }}
+            title={t.studio.resetToDefaultsTooltip || 'Reset all settings to default values'}
+          >
+            <RotateCcw size={13} />
+            <span>{t.studio.resetToDefaults || 'RESET TO DEFAULTS'}</span>
+          </button>
+
+          {/* Clip preview switcher */}
+          {allClips.length > 1 && (
+            <div className="preview-clip-picker-bar">
+              <span className="preview-picker-label">{t.studio.previewClip}</span>
+              <select
+                className="preview-clip-select"
+                value={previewClipIndex}
+                onChange={e => setPreviewClipIndex(Number(e.target.value))}
+              >
+                {allClips.map((clip, idx) => {
+                  const clipKey = `${clip.start_time}_${clip.end_time}`;
+                  const custom = customClipTitles[clipKey];
+                  const displayT = (custom !== undefined && custom.trim()) ? custom.trim() : (clip.title_suggestion || clip.title);
+                  return (
+                    <option key={idx} value={idx}>
+                      #{idx + 1}: {displayT} ({Math.round(clip.end_time - clip.start_time)}s)
+                    </option>
+                  );
+                })}
+              </select>
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Main Studio Grid: Controls (Left) + Real Image Live Preview (Right) */}
@@ -1292,7 +1782,7 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
         {/* Left Column: Interactive Controls */}
         <div className="studio-controls-pane">
           {/* 1. Canvas & Inner Aspect Ratio */}
-          <div className="studio-card-group">
+          <div className="studio-card-group group-canvas">
             <div className="group-header">
               <span className="group-title">{t.studio.canvasTitle}</span>
               <span className="group-badge">{t.studio.canvasBadge}</span>
@@ -1375,15 +1865,17 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
 
             {/* AI Active Speaker & Object Centering */}
             <div style={{ marginTop: '0.85rem' }}>
-              <div className="studio-checkbox-row">
+              <div className="studio-checkbox-row" style={{ display: 'flex', alignItems: 'flex-start', gap: '0.45rem', fontSize: '0.78rem' }}>
                 <input
                   type="checkbox"
                   id="faceTrackingSec"
                   checked={enableFaceTracking}
                   onChange={e => setEnableFaceTracking(e.target.checked)}
+                  style={{ width: '14px', height: '14px', cursor: 'pointer', marginTop: '2px', accentColor: 'var(--primary)' }}
                 />
-                <label htmlFor="faceTrackingSec">
-                  <strong>{t.studio.faceTracking}</strong> {t.studio.faceTrackingDesc}
+                <label htmlFor="faceTrackingSec" style={{ cursor: 'pointer', color: 'var(--text-secondary)', fontWeight: 400, fontSize: '0.78rem', lineHeight: 1.45 }}>
+                  <span style={{ color: 'var(--text-primary)', fontWeight: 500 }}>{t.studio.faceTracking}</span>{' '}
+                  <span style={{ color: 'var(--text-muted)', fontWeight: 400 }}>{t.studio.faceTrackingDesc}</span>
                 </label>
               </div>
 
@@ -1401,25 +1893,26 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                         border: `1px solid ${faceBox.type === 'salient_object' ? 'rgba(56, 189, 248, 0.3)' : 'rgba(34, 197, 94, 0.3)'}`,
                         fontWeight: 600
                       }}>
-                        {faceBox.type === 'salient_object' ? '🎯 AI Object Focus' : '👤 AI Face Focus'}
+                        {faceBox.type === 'salient_object' ? 'AI Object Focus' : 'AI Face Focus'}
                       </span>
                     )}
                   </div>
                   <div className="pill-group framing-pills" style={{ display: 'flex', flexWrap: 'wrap', gap: '0.4rem' }}>
                     {[
-                      { id: 'auto', label: t.studio.framingAuto || '🤖 AI Auto' },
-                      { id: 'center', label: t.studio.framingCenter || '🎯 Center (50%)' },
-                      { id: 'left', label: t.studio.framingLeft || '⬅️ Left Focus (35%)' },
-                      { id: 'right', label: t.studio.framingRight || '➡️ Right Focus (65%)' },
+                      { id: 'auto', label: t.studio.framingAuto || 'AI Auto (Face & Object)' },
+                      { id: 'center', label: t.studio.framingCenter || 'Center (50%)' },
+                      { id: 'left', icon: <ArrowLeft size={13} />, label: t.studio.framingLeft || 'Left Focus (35%)' },
+                      { id: 'right', icon: <ArrowRight size={13} />, label: t.studio.framingRight || 'Right Focus (65%)' },
                     ].map(opt => (
                       <button
                         key={opt.id}
                         type="button"
                         className={`pill-btn ${facecamPosition === opt.id ? 'active' : ''}`}
-                        style={{ fontSize: '0.75rem', padding: '0.3rem 0.65rem' }}
+                        style={{ fontSize: '0.75rem', padding: '0.35rem 0.65rem', display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}
                         onClick={() => setFacecamPosition(opt.id as FacecamPosition)}
                       >
-                        {opt.label}
+                        {opt.icon}
+                        <span>{opt.label.replace(/^[⬅️←<\->\s]+/, '')}</span>
                       </button>
                     ))}
                   </div>
@@ -1429,7 +1922,7 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
           </div>
 
           {/* 3. Streamer Facecam Presets */}
-          <div className="studio-card-group">
+          <div className="studio-card-group group-facecam">
             <div className="group-header">
               <span className="group-title">{t.studio.streamerTitle}</span>
             </div>
@@ -1513,7 +2006,7 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
           </div>
 
           {/* 4. Title / Hook Banner */}
-          <div className="studio-card-group">
+          <div className="studio-card-group group-title-banner">
             <div className="group-header">
               <span className="group-title">{t.studio.titleBannerTitle}</span>
               <span className="group-badge">
@@ -1524,7 +2017,7 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
             {/* Visibility Selector */}
             <div className="title-inputs-row" style={{ alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.65rem' }}>
               <span style={{ fontSize: '0.82rem', fontWeight: 600, color: 'var(--text-secondary)' }}>
-                {t.studio.subtitlesVisibilityLabel || "Banner Display:"}
+                {t.studio.titleVisibilityLabel || "Title Display:"}
               </span>
               <select
                 className="studio-select"
@@ -1537,14 +2030,20 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
               </select>
             </div>
 
+            {titlePosition === 'none' && (
+              <div className="subtitles-disabled-notice-box" style={{ marginBottom: '0.75rem' }}>
+                <span>[!] {t.studio.titleDisabledNotice || "Headline hook & title banner are disabled. Live preview and final export will have no hook banner."}</span>
+              </div>
+            )}
+
             {/* Prefix & Suffix Controls */}
             {titlePosition !== 'none' && (
               <>
                 {/* Active Clip Title Customizer */}
-                <div className="hook-clip-title-input-wrap" style={{ marginBottom: '0.75rem' }}>
+                <div className="hook-clip-title-input-wrap" style={{ marginBottom: '0.75rem', width: '100%' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.35rem' }}>
-                    <label className="hook-input-label" style={{ margin: 0, fontWeight: 600 }}>
-                      🏷️ {t.studio.clipTitleEditLabel || "Hook Title (Active Clip):"}
+                    <label className="hook-input-label" style={{ margin: 0, fontWeight: 500, fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
+                      // {t.studio.clipTitleEditLabel || "Hook Title (Active Clip):"}
                     </label>
                     {currentCustomTitle !== undefined && currentCustomTitle.trim() !== '' && currentCustomTitle !== (currentPreviewClip?.title_suggestion || currentPreviewClip?.title) && (
                       <button
@@ -1562,7 +2061,7 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                           border: 'none',
                           color: 'var(--primary, #38bdf8)',
                           fontSize: '0.74rem',
-                          fontWeight: 600,
+                          fontWeight: 500,
                           cursor: 'pointer',
                           padding: 0,
                           textDecoration: 'underline'
@@ -1575,6 +2074,7 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                   <input
                     type="text"
                     className="studio-text-input"
+                    style={{ width: '100%', boxSizing: 'border-box' }}
                     placeholder={currentPreviewClip?.title_suggestion || currentPreviewClip?.title || t.studio.titlePlaceholder}
                     value={currentCustomTitle !== undefined ? currentCustomTitle : (currentPreviewClip?.title_suggestion || currentPreviewClip?.title || '')}
                     onChange={e => {
@@ -1613,11 +2113,11 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                 {/* Combined Banner Preview Info */}
                 <div className="hook-banner-preview-box">
                   <div className="hook-base-badge">
-                    <span className="badge-tag">📌 {t.studio.titleBaseHookBadge}:</span>
+                    <span className="badge-tag">{t.studio.titleBaseHookBadge}:</span>
                     <span className="badge-text" title={baseClipHookTitle}>{baseClipHookTitle}</span>
                   </div>
                   <div className="hook-combined-result">
-                    <span className="combined-label">🏷️ {t.studio.titleFullPreview}</span>
+                    <span className="combined-label">{t.studio.titleFullPreview}</span>
                     <span className="combined-text">
                       {titlePrefix && <span className="pfx-highlight">{titlePrefix}</span>}
                       <span className="base-highlight">{baseClipHookTitle}</span>
@@ -1659,30 +2159,188 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                   </div>
                 </div>
 
-                {/* Title Text Size Option */}
+                {/* Title Font Family with Dedicated Dropzone */}
+                <div className="studio-font-section">
+                  <div className="font-section-header">
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
+                      <span className="sub-toggle-label" style={{ margin: 0, fontWeight: 600, color: 'var(--text-secondary)' }}>
+                        // {t.studio.titleFontFamily || "Title Font Family"}
+                      </span>
+                      <span className="badge" style={{ fontSize: '0.68rem', padding: '0.1rem 0.45rem', opacity: 0.85 }}>
+                        {titleFont}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Title Font Pills List */}
+                  <div className="toggle-pill-group" style={{ flexWrap: 'wrap', width: '100%' }}>
+                    {availableFonts.map(font => (
+                      <button
+                        key={`title-font-${font.name}`}
+                        type="button"
+                        className={`pill-btn ${titleFont === font.name ? 'active' : ''}`}
+                        onClick={() => setTitleFont(font.name)}
+                        style={{ fontFamily: font.name, fontSize: '0.78rem', fontWeight: titleFont === font.name ? 700 : 400 }}
+                      >
+                        {font.name}
+                        {font.is_custom && <span style={{ marginLeft: '4px', fontSize: '0.62rem', opacity: 0.85, color: '#fbbf24' }}>[*]</span>}
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* Title Font Drag & Drop Dropzone */}
+                  <div
+                    className={`font-dropzone ${isTitleFontDragging ? 'drag-over' : ''}`}
+                    onClick={() => titleFontInputRef.current?.click()}
+                    onDragOver={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setIsTitleFontDragging(true);
+                    }}
+                    onDragLeave={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setIsTitleFontDragging(false);
+                    }}
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setIsTitleFontDragging(false);
+                      const file = e.dataTransfer.files?.[0];
+                      if (file) handleUploadFont(file, 'title');
+                    }}
+                    title="Drag and drop or click to upload custom font file (.ttf, .otf, .woff, .woff2)"
+                  >
+                    <input
+                      ref={titleFontInputRef}
+                      type="file"
+                      accept=".ttf,.otf,.woff,.woff2"
+                      style={{ display: 'none' }}
+                      onChange={(e) => {
+                        const file = e.target.files?.[0];
+                        if (file) handleUploadFont(file, 'title');
+                        e.target.value = '';
+                      }}
+                      disabled={isUploadingFont}
+                    />
+                    <span className="font-dropzone-icon">
+                      {isUploadingFont ? '[...]' : isTitleFontDragging ? 'v' : '[+]'}
+                    </span>
+                    <div className="font-dropzone-text">
+                      <span className="font-dropzone-title">
+                        {isUploadingFont ? (t.studio.uploadingFont || 'Uploading font...') : (t.studio.dropFontHint || 'Upload Custom Font (.ttf, .otf, .woff, .woff2)')}
+                      </span>
+                      <span className="font-dropzone-desc">
+                        {t.studio.dropFontSub || 'Drag & drop font file here or click to browse'}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Title Text Size Option with Uncapped Manual Pixel Input */}
                 <div className="studio-sub-toggle" style={{ marginTop: '0.75rem' }}>
                   <span className="sub-toggle-label">{t.studio.titleFontSize || "Title Text Size:"}</span>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', flexWrap: 'wrap' }}>
+                    <div className="toggle-pill-group">
+                      <button
+                        type="button"
+                        className={`pill-btn ${titleFontSize === 'small' ? 'active' : ''}`}
+                        onClick={() => {
+                          setTitleFontSize('small');
+                          setTitleFontSizePx(50);
+                        }}
+                      >
+                        {t.studio.sizeSmall} (50px)
+                      </button>
+                      <button
+                        type="button"
+                        className={`pill-btn ${titleFontSize === 'medium' ? 'active' : ''}`}
+                        onClick={() => {
+                          setTitleFontSize('medium');
+                          setTitleFontSizePx(75);
+                        }}
+                      >
+                        {t.studio.sizeMedium} (75px)
+                      </button>
+                      <button
+                        type="button"
+                        className={`pill-btn ${titleFontSize === 'big' ? 'active' : ''}`}
+                        onClick={() => {
+                          setTitleFontSize('big');
+                          setTitleFontSizePx(100);
+                        }}
+                      >
+                        {t.studio.sizeBig} (100px)
+                      </button>
+                      <button
+                        type="button"
+                        className={`pill-btn ${titleFontSize === 'custom' ? 'active' : ''}`}
+                        onClick={() => setTitleFontSize('custom')}
+                      >
+                        {t.studio.sizeCustom || 'Custom'}
+                      </button>
+                    </div>
+                    {/* Manual Numeric PX Input (Unlimited, 1 - 1000px) */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
+                      <input
+                        type="number"
+                        min="1"
+                        max="1000"
+                        step="1"
+                        value={titleFontSizePx || ''}
+                        placeholder="px"
+                        onChange={(e) => {
+                          const raw = e.target.value;
+                          if (raw === '') {
+                            setTitleFontSizePx(0);
+                            setTitleFontSize('custom');
+                            return;
+                          }
+                          const num = parseInt(raw, 10);
+                          const val = isNaN(num) ? 0 : Math.max(1, Math.min(1000, num));
+                          setTitleFontSizePx(val);
+                          setTitleFontSize('custom');
+                        }}
+                        className="studio-text-input"
+                        style={{
+                          width: '72px',
+                          padding: '0.22rem 0.45rem',
+                          fontSize: '0.78rem',
+                          textAlign: 'center',
+                          borderRadius: '6px',
+                          border: titleFontSize === 'custom' ? '1px solid var(--primary, #38bdf8)' : '1px solid rgba(255,255,255,0.15)',
+                        }}
+                        title="Enter custom title font size in pixels (px, 1 - 1000)"
+                      />
+                      <span style={{ fontSize: '0.74rem', color: 'var(--text-muted)', fontWeight: 600 }}>px</span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Title Letter Style Option */}
+                <div className="studio-sub-toggle" style={{ marginTop: '0.75rem' }}>
+                  <span className="sub-toggle-label">{t.studio.titleLetterStyle || "Title Letter Style:"}</span>
                   <div className="toggle-pill-group">
                     <button
                       type="button"
-                      className={`pill-btn ${titleFontSize === 'small' ? 'active' : ''}`}
-                      onClick={() => setTitleFontSize('small')}
+                      className={`pill-btn ${titleTextCase === 'uppercase' ? 'active' : ''}`}
+                      onClick={() => setTitleTextCase('uppercase')}
                     >
-                      {t.studio.sizeSmall}
+                      {t.studio.letterCaps}
                     </button>
                     <button
                       type="button"
-                      className={`pill-btn ${titleFontSize === 'medium' ? 'active' : ''}`}
-                      onClick={() => setTitleFontSize('medium')}
+                      className={`pill-btn ${titleTextCase === 'capitalize' ? 'active' : ''}`}
+                      onClick={() => setTitleTextCase('capitalize')}
                     >
-                      {t.studio.sizeMedium}
+                      {t.studio.letterTitle}
                     </button>
                     <button
                       type="button"
-                      className={`pill-btn ${titleFontSize === 'big' ? 'active' : ''}`}
-                      onClick={() => setTitleFontSize('big')}
+                      className={`pill-btn ${titleTextCase === 'lowercase' ? 'active' : ''}`}
+                      onClick={() => setTitleTextCase('lowercase')}
                     >
-                      {t.studio.sizeBig}
+                      {t.studio.letterLower}
                     </button>
                   </div>
                 </div>
@@ -1691,7 +2349,7 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                 <div className="studio-sub-toggle" style={{ marginTop: '0.85rem', flexDirection: 'column', alignItems: 'stretch' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.4rem' }}>
                     <span className="sub-toggle-label" style={{ margin: 0 }}>
-                      {t.studio.titleYLabel || "🏷️ Title Vertical Position:"}
+                      {t.studio.titleYLabel || "// Title Vertical Position:"}
                     </span>
                     <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
                       <span className="badge" style={{ fontSize: '0.74rem', padding: '0.15rem 0.45rem' }}>
@@ -1719,6 +2377,7 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                       setIsCustomTitleY(true);
                     }}
                     className="position-slider"
+                    style={{ '--slider-progress': `${Math.max(0, Math.min(100, ((safeTitleY - 3) / (maxTitleY - 3 || 1)) * 100))}%` } as React.CSSProperties}
                   />
                   <div className="quick-presets-row" style={{ display: 'flex', gap: '0.4rem', marginTop: '0.4rem', flexWrap: 'wrap' }}>
                     <button
@@ -1758,7 +2417,7 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
           </div>
 
           {/* 5. Subtitle Style & Font */}
-          <div className="studio-card-group">
+          <div className="studio-card-group group-subtitles">
             <div className="group-header">
               <span className="group-title">{t.studio.subtitlesTitle}</span>
               <span className="group-badge success-badge">{t.studio.strictlyOneLine}</span>
@@ -1792,11 +2451,11 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
 
             {captionStyle === 'none' && (
               <div className="subtitles-disabled-notice-box" style={{ marginBottom: '0.75rem' }}>
-                <span>🚫 {t.studio.subtitlesDisabledNotice}</span>
+                <span>[!] {t.studio.subtitlesDisabledNotice}</span>
               </div>
             )}
 
-            <div className={`caption-styles-grid ${captionStyle === 'none' ? 'subtitles-dimmed' : ''}`}>
+            <div className={`caption-styles-grid ${captionStyle === 'none' ? 'subtitles-dimmed' : ''}`} style={{ fontFamily: captionFont }}>
               <button
                 type="button"
                 className={`caption-style-card viral-pop ${captionStyle === 'viral_pop' ? 'active' : ''}`}
@@ -1907,60 +2566,161 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
 
             {captionStyle !== 'none' && (
               <>
-                {/* Font Family */}
-                <div className="studio-sub-toggle" style={{ marginTop: '0.85rem' }}>
-                  <span className="sub-toggle-label">{t.studio.fontFamily}</span>
-                  <div className="toggle-pill-group" style={{ flexWrap: 'wrap' }}>
-                    {(
-                      [
-                        'Outfit',
-                        'Montserrat',
-                        'Inter',
-                        'Impact',
-                        'Bebas Neue',
-                        'Anton',
-                        'Poppins',
-                        'Arial Black',
-                      ] as CaptionFont[]
-                    ).map(font => (
+                {/* Subtitle Font Family with Dedicated Dropzone */}
+                <div className="studio-font-section">
+                  <div className="font-section-header">
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
+                      <span className="sub-toggle-label" style={{ margin: 0, fontWeight: 600, color: 'var(--text-secondary)' }}>
+                        // {t.studio.fontFamily}
+                      </span>
+                      <span className="badge" style={{ fontSize: '0.68rem', padding: '0.1rem 0.45rem', opacity: 0.85 }}>
+                        {captionFont}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Subtitle Font Pills List */}
+                  <div className="toggle-pill-group" style={{ flexWrap: 'wrap', width: '100%' }}>
+                    {availableFonts.map(font => (
                       <button
-                        key={font}
+                        key={`sub-font-${font.name}`}
                         type="button"
-                        className={`pill-btn ${captionFont === font ? 'active' : ''}`}
-                        onClick={() => setCaptionFont(font)}
-                        style={{ fontFamily: font, fontSize: '0.78rem' }}
+                        className={`pill-btn ${captionFont === font.name ? 'active' : ''}`}
+                        onClick={() => setCaptionFont(font.name)}
+                        style={{ fontFamily: font.name, fontSize: '0.78rem', fontWeight: captionFont === font.name ? 700 : 400 }}
                       >
-                        {font}
+                        {font.name}
+                        {font.is_custom && <span style={{ marginLeft: '4px', fontSize: '0.62rem', opacity: 0.85, color: '#fbbf24' }}>[*]</span>}
                       </button>
                     ))}
                   </div>
+
+                  {/* Subtitle Font Drag & Drop Dropzone */}
+                  <div
+                    className={`font-dropzone ${isSubFontDragging ? 'drag-over' : ''}`}
+                    onClick={() => subtitleFontInputRef.current?.click()}
+                    onDragOver={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setIsSubFontDragging(true);
+                    }}
+                    onDragLeave={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setIsSubFontDragging(false);
+                    }}
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setIsSubFontDragging(false);
+                      const file = e.dataTransfer.files?.[0];
+                      if (file) handleUploadFont(file, 'subtitle');
+                    }}
+                    title="Drag and drop or click to upload custom font file (.ttf, .otf, .woff, .woff2)"
+                  >
+                    <input
+                      ref={subtitleFontInputRef}
+                      type="file"
+                      accept=".ttf,.otf,.woff,.woff2"
+                      style={{ display: 'none' }}
+                      onChange={(e) => {
+                        const file = e.target.files?.[0];
+                        if (file) handleUploadFont(file, 'subtitle');
+                        e.target.value = '';
+                      }}
+                      disabled={isUploadingFont}
+                    />
+                    <span className="font-dropzone-icon">
+                      {isUploadingFont ? '[...]' : isSubFontDragging ? 'v' : '[+]'}
+                    </span>
+                    <div className="font-dropzone-text">
+                      <span className="font-dropzone-title">
+                        {isUploadingFont ? (t.studio.uploadingFont || 'Uploading font...') : (t.studio.dropFontHint || 'Upload Custom Font (.ttf, .otf, .woff, .woff2)')}
+                      </span>
+                      <span className="font-dropzone-desc">
+                        {t.studio.dropFontSub || 'Drag & drop font file here or click to browse'}
+                      </span>
+                    </div>
+                  </div>
                 </div>
 
-                {/* Font Size Presets */}
+                {/* Subtitle Font Size Presets & Uncapped Manual PX Input */}
                 <div className="studio-sub-toggle" style={{ marginTop: '0.75rem' }}>
                   <span className="sub-toggle-label">{t.studio.fontSize}</span>
-                  <div className="toggle-pill-group">
-                    <button
-                      type="button"
-                      className={`pill-btn ${fontSize === 'small' ? 'active' : ''}`}
-                      onClick={() => setFontSize('small')}
-                    >
-                      {t.studio.sizeSmall}
-                    </button>
-                    <button
-                      type="button"
-                      className={`pill-btn ${fontSize === 'medium' ? 'active' : ''}`}
-                      onClick={() => setFontSize('medium')}
-                    >
-                      {t.studio.sizeMedium}
-                    </button>
-                    <button
-                      type="button"
-                      className={`pill-btn ${fontSize === 'big' ? 'active' : ''}`}
-                      onClick={() => setFontSize('big')}
-                    >
-                      {t.studio.sizeBig}
-                    </button>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', flexWrap: 'wrap' }}>
+                    <div className="toggle-pill-group">
+                      <button
+                        type="button"
+                        className={`pill-btn ${fontSize === 'small' ? 'active' : ''}`}
+                        onClick={() => {
+                          setFontSize('small');
+                          setFontSizePx(55);
+                        }}
+                      >
+                        {t.studio.sizeSmall} (55px)
+                      </button>
+                      <button
+                        type="button"
+                        className={`pill-btn ${fontSize === 'medium' ? 'active' : ''}`}
+                        onClick={() => {
+                          setFontSize('medium');
+                          setFontSizePx(75);
+                        }}
+                      >
+                        {t.studio.sizeMedium} (75px)
+                      </button>
+                      <button
+                        type="button"
+                        className={`pill-btn ${fontSize === 'big' ? 'active' : ''}`}
+                        onClick={() => {
+                          setFontSize('big');
+                          setFontSizePx(95);
+                        }}
+                      >
+                        {t.studio.sizeBig} (95px)
+                      </button>
+                      <button
+                        type="button"
+                        className={`pill-btn ${fontSize === 'custom' ? 'active' : ''}`}
+                        onClick={() => setFontSize('custom')}
+                      >
+                        {t.studio.sizeCustom || 'Custom'}
+                      </button>
+                    </div>
+                    {/* Manual Numeric PX Input (Unlimited, 1 - 1000px) */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
+                      <input
+                        type="number"
+                        min="1"
+                        max="1000"
+                        step="1"
+                        value={fontSizePx || ''}
+                        placeholder="px"
+                        onChange={(e) => {
+                          const raw = e.target.value;
+                          if (raw === '') {
+                            setFontSizePx(0);
+                            setFontSize('custom');
+                            return;
+                          }
+                          const num = parseInt(raw, 10);
+                          const val = isNaN(num) ? 0 : Math.max(1, Math.min(1000, num));
+                          setFontSizePx(val);
+                          setFontSize('custom');
+                        }}
+                        className="studio-text-input"
+                        style={{
+                          width: '72px',
+                          padding: '0.22rem 0.45rem',
+                          fontSize: '0.78rem',
+                          textAlign: 'center',
+                          borderRadius: '6px',
+                          border: fontSize === 'custom' ? '1px solid var(--primary, #38bdf8)' : '1px solid rgba(255,255,255,0.15)',
+                        }}
+                        title="Enter custom subtitle font size in pixels (px, 1 - 1000)"
+                      />
+                      <span style={{ fontSize: '0.74rem', color: 'var(--text-muted)', fontWeight: 600 }}>px</span>
+                    </div>
                   </div>
                 </div>
 
@@ -2017,7 +2777,7 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                   <div className="studio-sub-toggle" style={{ marginTop: '0.75rem', flexDirection: 'column', alignItems: 'stretch' }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.4rem' }}>
                       <span className="sub-toggle-label" style={{ margin: 0 }}>
-                        {t.studio.subYBottomLabel || "💬 Subtitle Bottom Position:"}
+                        {t.studio.subYBottomLabel || "// Subtitle Bottom Position:"}
                       </span>
                       <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
                         <span className="badge" style={{ fontSize: '0.74rem', padding: '0.15rem 0.45rem' }}>
@@ -2042,6 +2802,7 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                       value={safeSubtitleY}
                       onChange={(e) => setSubtitleYPercent(Number(e.target.value))}
                       className="position-slider"
+                      style={{ '--slider-progress': `${Math.max(0, Math.min(100, ((safeSubtitleY - 5) / (maxSubY - 5 || 1)) * 100))}%` } as React.CSSProperties}
                     />
                     <div className="quick-presets-row" style={{ display: 'flex', gap: '0.4rem', marginTop: '0.4rem', flexWrap: 'wrap' }}>
                       <button
@@ -2082,7 +2843,7 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                   <div className="studio-sub-toggle" style={{ marginTop: '0.75rem', flexDirection: 'column', alignItems: 'stretch' }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.4rem' }}>
                       <span className="sub-toggle-label" style={{ margin: 0 }}>
-                        {t.studio.subYCenterLabel || "🎯 Subtitle Center Vertical Position:"}
+                        {t.studio.subYCenterLabel || "> Subtitle Center Vertical Position:"}
                       </span>
                       <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
                         <span className="badge" style={{ fontSize: '0.74rem', padding: '0.15rem 0.45rem' }}>
@@ -2114,6 +2875,7 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                       value={safeSubCenterY}
                       onChange={(e) => setSubtitleCenterYPercent(Number(e.target.value))}
                       className="position-slider"
+                      style={{ '--slider-progress': `${Math.max(0, Math.min(100, ((safeSubCenterY - minCenterY) / (maxCenterY - minCenterY || 1)) * 100))}%` } as React.CSSProperties}
                     />
                     <div className="quick-presets-row" style={{ display: 'flex', gap: '0.4rem', marginTop: '0.4rem', flexWrap: 'wrap' }}>
                       <button
@@ -2148,7 +2910,7 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
           </div>
 
           {/* 6. Background Music (BGM) */}
-          <div className="studio-card-group">
+          <div className="studio-card-group group-bgm">
             <div className="group-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
                 <span className="group-title">{t.studio.bgmTitle}</span>
@@ -2197,7 +2959,9 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                     style={{ display: 'none' }}
                     disabled={isUploadingBgm}
                   />
-                  <div className="dropzone-icon">{isUploadingBgm ? '⏳' : isBgmDragging ? '📥' : '🎶'}</div>
+                  <div className="dropzone-icon" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    {isUploadingBgm ? <RefreshCw size={20} className="spinner-icon" /> : <Music size={20} color="var(--primary)" />}
+                  </div>
                   <div className="dropzone-text">
                     <span className="dropzone-main-text">
                       {isUploadingBgm ? 'Uploading Audio...' : isBgmDragging ? t.studio.bgmDropActive : t.studio.bgmUploadMain}
@@ -2208,7 +2972,9 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
               ) : (
                 <div className="bgm-active-file-row">
                   <div className="bgm-info">
-                    <span className="bgm-icon">🎧</span>
+                    <span className="bgm-icon" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                      <Music size={16} color="var(--primary)" />
+                    </span>
                     <div className="bgm-details">
                       <span className="bgm-filename" title={bgmFileName}>{bgmFileName}</span>
                       <span className="bgm-status-tag">{t.studio.bgmReadyTag}</span>
@@ -2221,8 +2987,9 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                         className="bgm-preview-btn"
                         onClick={toggleBgmPlayback}
                         title={isBgmPlaying ? t.studio.bgmPause : t.studio.bgmPlay}
+                        style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}
                       >
-                        {isBgmPlaying ? '⏸' : '▶'}
+                        {isBgmPlaying ? <Pause size={12} /> : <Play size={12} />}
                       </button>
                     )}
                     <button
@@ -2262,6 +3029,7 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                     step="1"
                     value={bgmVolume}
                     onChange={e => setBgmVolume(Number(e.target.value))}
+                    style={{ '--slider-progress': `${Math.max(0, Math.min(100, bgmVolume))}%` } as React.CSSProperties}
                   />
                   <div className="slider-quick-buttons">
                     <button type="button" onClick={() => setBgmVolume(10)}>10%</button>
@@ -2286,6 +3054,7 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                       step="0.5"
                       value={bgmStartOffset}
                       onChange={e => handleBgmStartOffsetChange(Number(e.target.value))}
+                      style={{ '--slider-progress': `${Math.max(0, Math.min(100, (bgmStartOffset / (bgmDuration > 0 ? Math.floor(bgmDuration) : 180)) * 100))}%` } as React.CSSProperties}
                     />
                     <div className="slider-quick-buttons" style={{ display: 'flex', flexWrap: 'wrap', gap: '0.35rem', marginTop: '0.35rem' }}>
                       <button type="button" onClick={() => handleBgmStartOffsetChange(0)}>{t.studio.bgmStartFromBeginning}</button>
@@ -2317,22 +3086,12 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
           </div>
 
           {/* 6. Hook Sound Effect (SFX) */}
-          <div className="studio-card-group">
+          <div className="studio-card-group group-sfx">
             <div className="group-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
-                <span className="group-title">{t.studio.hookSfxTitle}</span>
-                <label style={{ display: 'inline-flex', alignItems: 'center', cursor: 'pointer' }}>
-                  <input
-                    type="checkbox"
-                    checked={hookSfxEnabled}
-                    onChange={e => setHookSfxEnabled(e.target.checked)}
-                    style={{ accentColor: 'var(--primary)', width: '16px', height: '16px', cursor: 'pointer' }}
-                  />
-                </label>
-                <span className={`status-pill ${hookSfxEnabled && hookSfxFilePath ? 'pill-active' : ''}`} style={{ fontSize: '0.68rem', padding: '0.15rem 0.5rem' }}>
-                  {hookSfxEnabled && hookSfxFilePath ? t.studio.hookSfxActiveBadge : t.studio.bgmOptionalBadge}
-                </span>
-              </div>
+              <span className="group-title">{t.studio.hookSfxTitle}</span>
+              <span className="group-badge" style={{ color: hookSfxFilePath ? '#10b981' : 'var(--text-muted)', fontWeight: 500 }}>
+                {hookSfxFilePath ? t.studio.hookSfxActiveBadge : t.studio.bgmOptionalBadge}
+              </span>
             </div>
 
             <div className="group-content" style={{ marginTop: '0.6rem' }}>
@@ -2364,7 +3123,7 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                     style={{ display: 'none' }}
                     disabled={isUploadingHookSfx}
                   />
-                  <div className="dropzone-icon">{isUploadingHookSfx ? '⏳' : isHookSfxDragging ? '📥' : '⚡'}</div>
+                  <div className="dropzone-icon">{isUploadingHookSfx ? '[...]' : isHookSfxDragging ? 'v' : '*'}</div>
                   <div className="dropzone-text">
                     <span className="dropzone-main-text">
                       {isUploadingHookSfx ? 'Uploading SFX...' : isHookSfxDragging ? t.studio.hookSfxDropActive : t.studio.hookSfxUploadMain}
@@ -2375,7 +3134,7 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
               ) : (
                 <div className="bgm-active-file-row">
                   <div className="bgm-info">
-                    <span className="bgm-icon">⚡</span>
+                    <span className="bgm-icon">*</span>
                     <div className="bgm-details">
                       <span className="bgm-filename" title={hookSfxFileName}>{hookSfxFileName}</span>
                       <span className="bgm-status-tag" style={{ background: 'rgba(234, 179, 8, 0.15)', color: '#facc15', borderColor: 'rgba(234, 179, 8, 0.3)' }}>
@@ -2431,6 +3190,7 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                     step="5"
                     value={hookSfxVolume}
                     onChange={e => setHookSfxVolume(Number(e.target.value))}
+                    style={{ '--slider-progress': `${Math.max(0, Math.min(100, (hookSfxVolume / 150) * 100))}%` } as React.CSSProperties}
                   />
                   <div className="slider-quick-buttons">
                     <button type="button" onClick={() => setHookSfxVolume(50)}>50%</button>
@@ -2445,12 +3205,12 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
           </div>
 
           {/* 7. Original Clip Voice Audio Boost */}
-          <div className="studio-card-group">
+          <div className="studio-card-group group-audio-boost">
             <div className="group-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
                 <span className="group-title">{t.studio.rawAudioTitle}</span>
                 <span className={`status-pill ${originalAudioVolume > 100 ? 'pill-active' : ''}`} style={{ fontSize: '0.68rem', padding: '0.15rem 0.5rem' }}>
-                  {originalAudioVolume > 100 ? `⚡ Boosted (${originalAudioVolume}%)` : `${originalAudioVolume}% Volume`}
+                  {originalAudioVolume > 100 ? `* Boosted (${originalAudioVolume}%)` : `${originalAudioVolume}% Volume`}
                 </span>
               </div>
             </div>
@@ -2480,6 +3240,7 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                   step="5"
                   value={originalAudioVolume}
                   onChange={e => setOriginalAudioVolume(Number(e.target.value))}
+                  style={{ '--slider-progress': `${Math.max(0, Math.min(100, (originalAudioVolume / 200) * 100))}%` } as React.CSSProperties}
                 />
                 <div className="slider-quick-buttons">
                   <button type="button" onClick={() => setOriginalAudioVolume(50)}>50%</button>
@@ -2495,19 +3256,19 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
           </div>
 
           {/* 8. Video Watermark Branding */}
-          <div className="studio-card-group">
-            <div className="group-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <div className="studio-card-group group-watermark" style={!watermarkEnabled ? { padding: '1rem 1.4rem' } : undefined}>
+            <div className="group-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: watermarkEnabled ? '0.85rem' : 0 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
-                <span className="group-title">{t.studio.watermarkTitle}</span>
-                <label style={{ display: 'inline-flex', alignItems: 'center', cursor: 'pointer' }}>
+                <span className="group-title" style={{ margin: 0 }}>{t.studio.watermarkTitle}</span>
+                <label style={{ display: 'inline-flex', alignItems: 'center', cursor: 'pointer', margin: 0 }}>
                   <input
                     type="checkbox"
                     checked={watermarkEnabled}
                     onChange={e => setWatermarkEnabled(e.target.checked)}
-                    style={{ accentColor: 'var(--primary)', width: '16px', height: '16px', cursor: 'pointer' }}
+                    style={{ accentColor: 'var(--primary)', width: '15px', height: '15px', cursor: 'pointer', margin: 0 }}
                   />
                 </label>
-                <span className={`status-pill ${watermarkEnabled ? 'pill-active' : ''}`} style={{ fontSize: '0.68rem', padding: '0.15rem 0.5rem' }}>
+                <span className={`status-pill ${watermarkEnabled ? 'pill-active' : ''}`} style={{ fontSize: '0.68rem', padding: '0.15rem 0.5rem', fontWeight: 500 }}>
                   {watermarkEnabled ? t.studio.watermarkBadgeEnabled : t.studio.watermarkBadgeDisabled}
                 </span>
               </div>
@@ -2566,7 +3327,7 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                           style={{ display: 'none' }}
                           disabled={isUploadingWatermark}
                         />
-                        <div className="dropzone-icon">{isUploadingWatermark ? '⏳' : isWatermarkDragging ? '📥' : '🖼️'}</div>
+                        <div className="dropzone-icon">{isUploadingWatermark ? <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg> : isWatermarkDragging ? <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg> : <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>}</div>
                         <div className="dropzone-text">
                           <span className="dropzone-main-text">
                             {isUploadingWatermark ? 'Uploading Watermark...' : isWatermarkDragging ? t.studio.watermarkDropActive : t.studio.watermarkUploadMain}
@@ -2637,6 +3398,7 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                       step="1"
                       value={watermarkSize}
                       onChange={e => setWatermarkSize(Number(e.target.value))}
+                      style={{ '--slider-progress': `${Math.max(0, Math.min(100, (watermarkSize / 500) * 100))}%` } as React.CSSProperties}
                     />
                     <div className="slider-quick-buttons" style={{ display: 'flex', flexWrap: 'wrap', gap: '0.35rem', marginTop: '0.35rem' }}>
                       {[10, 25, 50, 100, 200, 350, 500].map(sz => (
@@ -2685,6 +3447,7 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                       step="5"
                       value={watermarkOpacity}
                       onChange={e => setWatermarkOpacity(Number(e.target.value))}
+                      style={{ '--slider-progress': `${Math.max(0, Math.min(100, ((watermarkOpacity - 10) / (90)) * 100))}%` } as React.CSSProperties}
                     />
                   </div>
 
@@ -2712,6 +3475,7 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                       step="1"
                       value={watermarkX}
                       onChange={e => setWatermarkX(Number(e.target.value))}
+                      style={{ '--slider-progress': `${Math.max(0, Math.min(100, watermarkX))}%` } as React.CSSProperties}
                     />
                   </div>
 
@@ -2739,6 +3503,7 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                       step="1"
                       value={watermarkY}
                       onChange={e => setWatermarkY(Number(e.target.value))}
+                      style={{ '--slider-progress': `${Math.max(0, Math.min(100, watermarkY))}%` } as React.CSSProperties}
                     />
                   </div>
 
@@ -2779,101 +3544,8 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
             )}
           </div>
 
-          {/* 8. Hardware Acceleration & Video Encoder */}
-          <div className="studio-card-group">
-            <div className="group-header">
-              <span className="group-title">⚡ {t.studio.hwTitle}</span>
-              <span className="group-badge">{t.studio.hwBadge}</span>
-            </div>
-            <p style={{ fontSize: '0.78rem', color: 'var(--text-secondary)', margin: '0 0 0.85rem 0', lineHeight: 1.4 }}>
-              {t.studio.hwSubtitle}
-            </p>
-
-            <div className="hardware-options-grid">
-              {/* Auto Option */}
-              <button
-                type="button"
-                className={`hardware-option-card ${hardwareAccel === 'auto' ? 'active' : ''}`}
-                onClick={() => setHardwareAccel('auto')}
-              >
-                <div className="hw-card-top">
-                  <div className="hw-radio-dot"></div>
-                  <span className="hw-card-name">{t.studio.hwAuto}</span>
-                  <span className="hw-status-pill active">{t.studio.hwDetectedPill}</span>
-                </div>
-                <span className="hw-card-sub">
-                  {hardwareInfo?.recommended
-                    ? `${t.studio.hwAutoDesc} · (${hardwareInfo.recommended.toUpperCase()})`
-                    : t.studio.hwAutoDesc}
-                </span>
-              </button>
-
-              {/* NVIDIA NVENC */}
-              <button
-                type="button"
-                className={`hardware-option-card ${hardwareAccel === 'nvenc' ? 'active' : ''}`}
-                onClick={() => setHardwareAccel('nvenc')}
-              >
-                <div className="hw-card-top">
-                  <div className="hw-radio-dot"></div>
-                  <span className="hw-card-name">{t.studio.hwNvenc}</span>
-                  <span className={`hw-status-pill ${hardwareInfo?.support?.nvenc ? 'active' : 'inactive'}`}>
-                    {hardwareInfo?.support?.nvenc ? t.studio.hwSupportedPill : t.studio.hwUnavailablePill}
-                  </span>
-                </div>
-                <span className="hw-card-sub">{t.studio.hwNvencDesc}</span>
-              </button>
-
-              {/* AMD AMF */}
-              <button
-                type="button"
-                className={`hardware-option-card ${hardwareAccel === 'amf' ? 'active' : ''}`}
-                onClick={() => setHardwareAccel('amf')}
-              >
-                <div className="hw-card-top">
-                  <div className="hw-radio-dot"></div>
-                  <span className="hw-card-name">{t.studio.hwAmf}</span>
-                  <span className={`hw-status-pill ${hardwareInfo?.support?.amf ? 'active' : 'inactive'}`}>
-                    {hardwareInfo?.support?.amf ? t.studio.hwSupportedPill : t.studio.hwUnavailablePill}
-                  </span>
-                </div>
-                <span className="hw-card-sub">{t.studio.hwAmfDesc}</span>
-              </button>
-
-              {/* Intel QuickSync */}
-              <button
-                type="button"
-                className={`hardware-option-card ${hardwareAccel === 'qsv' ? 'active' : ''}`}
-                onClick={() => setHardwareAccel('qsv')}
-              >
-                <div className="hw-card-top">
-                  <div className="hw-radio-dot"></div>
-                  <span className="hw-card-name">{t.studio.hwQsv}</span>
-                  <span className={`hw-status-pill ${hardwareInfo?.support?.qsv ? 'active' : 'inactive'}`}>
-                    {hardwareInfo?.support?.qsv ? t.studio.hwSupportedPill : t.studio.hwUnavailablePill}
-                  </span>
-                </div>
-                <span className="hw-card-sub">{t.studio.hwQsvDesc}</span>
-              </button>
-
-              {/* CPU Software libx264 */}
-              <button
-                type="button"
-                className={`hardware-option-card ${hardwareAccel === 'cpu' ? 'active' : ''}`}
-                onClick={() => setHardwareAccel('cpu')}
-              >
-                <div className="hw-card-top">
-                  <div className="hw-radio-dot"></div>
-                  <span className="hw-card-name">{t.studio.hwCpu}</span>
-                  <span className="hw-status-pill active">{t.studio.hwSupportedPill}</span>
-                </div>
-                <span className="hw-card-sub">{t.studio.hwCpuDesc}</span>
-              </button>
-            </div>
-          </div>
-
           {/* Video File Name Option */}
-          <div className="studio-card-group">
+          <div className="studio-card-group group-filename">
             <div className="group-header">
               <span className="group-title">{t.studio.fileNameTitle}</span>
               <span className="group-badge">{t.studio.fileNameBadge}</span>
@@ -2909,7 +3581,9 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                 <span className="filename-preview-tag">.mp4</span>
               </div>
               <div className="filename-preview-display">
-                <span className="fn-icon">📄</span>
+                <span className="fn-icon" style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <FileCode size={14} color="var(--primary)" />
+                </span>
                 <span className="fn-text">
                   {fileNamePrefix && <span className="pfx-highlight">{fileNamePrefix.replace(/[\\/*?:"<>|]/g, '')}</span>}
                   <span className="base-highlight">{sampleCleanTitle}</span>
@@ -2922,7 +3596,7 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
           </div>
 
           {/* Batch Clip Hook / Title Customizer for All Selected Clips */}
-          <div className="studio-card-group">
+          <div className="studio-card-group group-batch-titles">
             <div className="group-header">
               <span className="group-title">{t.studio.batchClipTitlesTitle}</span>
               <span className="group-badge">
@@ -2960,14 +3634,36 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                         <div className="batch-title-card-left">
                           <span className="batch-title-clip-badge">#{clipDisplayNum}</span>
                           <span className="batch-title-ts">
-                            ⏱️ {Math.floor(clip.start_time / 60)}:{(clip.start_time % 60).toFixed(0).padStart(2, '0')} - {Math.floor(clip.end_time / 60)}:{(clip.end_time % 60).toFixed(0).padStart(2, '0')} ({(clip.end_time - clip.start_time).toFixed(0)}s)
+                             {Math.floor(clip.start_time / 60)}:{(clip.start_time % 60).toFixed(0).padStart(2, '0')} - {Math.floor(clip.end_time / 60)}:{(clip.end_time % 60).toFixed(0).padStart(2, '0')} ({(clip.end_time - clip.start_time).toFixed(0)}s)
                           </span>
                           {typeof clip.virality_score === 'number' && (
-                            <span className="batch-title-score-pill">🔥 {clip.virality_score}%</span>
+                            <span className="batch-title-score-pill"> {clip.virality_score}%</span>
                           )}
                         </div>
 
                         <div className="batch-title-card-right">
+                          {renderMode === 'merged' && (
+                            <div className="segment-reorder-group">
+                              <button
+                                type="button"
+                                className="segment-reorder-btn"
+                                onClick={() => handleMoveClipUp(i)}
+                                disabled={i === 0}
+                                title={t.studio.moveSegmentUp}
+                              >
+                                ▲
+                              </button>
+                              <button
+                                type="button"
+                                className="segment-reorder-btn"
+                                onClick={() => handleMoveClipDown(i)}
+                                disabled={i === selectedClips.length - 1}
+                                title={t.studio.moveSegmentDown}
+                              >
+                                ▼
+                              </button>
+                            </div>
+                          )}
                           {hasCustomTitle && (
                             <button
                               type="button"
@@ -3032,8 +3728,77 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
             )}
           </div>
 
+          {/* Export Mode Switcher (Separate vs Merged Highlight Video) */}
+          <div className="studio-card-group export-mode-group group-export-mode">
+            <div className="group-header">
+              <span className="group-title">* {t.studio.renderModeTitle}</span>
+              {renderMode === 'merged' && (
+                <span className="group-badge" style={{ background: 'rgba(16, 185, 129, 0.15)', color: '#34d399', border: '1px solid rgba(16, 185, 129, 0.3)' }}>
+                  {t.studio.compilationSegmentsSummary(selectedClips.length, totalSelectedDuration)}
+                </span>
+              )}
+            </div>
+
+            <div className="export-mode-switcher">
+              <button
+                type="button"
+                className={`export-mode-btn ${renderMode === 'separate' ? 'active' : ''}`}
+                onClick={() => setRenderMode('separate')}
+              >
+                <div className="mode-btn-content">
+                  <span className="mode-btn-title">{t.studio.renderModeSeparate}</span>
+                  <span className="mode-btn-desc">{t.studio.renderModeSeparateDesc}</span>
+                </div>
+              </button>
+
+              <button
+                type="button"
+                className={`export-mode-btn ${renderMode === 'merged' ? 'active' : ''}`}
+                onClick={() => setRenderMode('merged')}
+              >
+                <div className="mode-btn-content">
+                  <span className="mode-btn-title">{t.studio.renderModeMerged}</span>
+                  <span className="mode-btn-desc">{t.studio.renderModeMergedDesc}</span>
+                </div>
+              </button>
+            </div>
+
+            {/* If Merged mode is selected, show Merged Video File Name input */}
+            {renderMode === 'merged' && (
+              <div className="compilation-config-card">
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.45rem' }}>
+                  <label className="compilation-label" style={{ margin: 0, fontWeight: 500, fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
+                    <span>[+] {t.studio.compilationHookLabel}</span>
+                  </label>
+                  <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', fontWeight: 400 }}>
+                    {t.studio.fileNameBadge || 'Optional'}
+                  </span>
+                </div>
+                <input
+                  type="text"
+                  className="compilation-title-input"
+                  placeholder={
+                    (() => {
+                      if (selectedClips.length === 0) return t.studio.compilationHookPlaceholder;
+                      const first = selectedClips[0];
+                      const firstKey = `${first.start_time}_${first.end_time}`;
+                      const custom = customClipTitles[firstKey];
+                      const base = (custom !== undefined && custom.trim()) ? custom.trim() : (first.title_suggestion || first.title || 'Highlight Video');
+                      return `${base.trim()} (Merged)`;
+                    })()
+                  }
+                  value={compilationTitle}
+                  onChange={e => setCompilationTitle(e.target.value)}
+                />
+                <p style={{ margin: '0.4rem 0 0 0', fontSize: '0.72rem', color: 'var(--text-muted)', fontWeight: 400, lineHeight: 1.4 }}>
+                  {t.studio.compilationFileNameHint}
+                </p>
+              </div>
+            )}
+          </div>
+
           {/* 9. Selected Clips Checklist */}
-          <div className="studio-card-group">
+          <div className="studio-card-group group-checklist">
             <div className="group-header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%', gap: '0.5rem' }}>
               <span className="group-title">
                 {t.studio.batchChecklist(selectedClips.length, allClips.length)}
@@ -3088,7 +3853,7 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                         })()}
                       </span>
                       <span className="batch-clip-ts">
-                        ⏱️ {Math.floor(clip.start_time / 60)}:{(clip.start_time % 60).toFixed(0).padStart(2, '0')} -{' '}
+                         {Math.floor(clip.start_time / 60)}:{(clip.start_time % 60).toFixed(0).padStart(2, '0')} -{' '}
                         {Math.floor(clip.end_time / 60)}:{(clip.end_time % 60).toFixed(0).padStart(2, '0')} (
                         {(clip.end_time - clip.start_time).toFixed(0)}s) · Score: {clip.virality_score}%
                       </span>
@@ -3096,6 +3861,228 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                   </div>
                 );
               })}
+            </div>
+          </div>
+
+          {/* 10. Hardware Acceleration & Video Encoder (Placed at the very bottom of controls pane) */}
+          <div className="studio-card-group group-hw">
+            <div className="group-header" style={{ marginBottom: '0.65rem' }}>
+              <span className="group-title">{t.studio.hwTitle}</span>
+              <span className="group-badge" style={{ fontWeight: 600 }}>
+                {hardwareAccel === 'browser_wasm'
+                  ? 'WASM'
+                  : hardwareAccel === 'auto'
+                  ? (hardwareInfo?.recommended ? hardwareInfo.recommended.toUpperCase() : t.studio.hwDetectedPill)
+                  : hardwareAccel.toUpperCase()}
+              </span>
+            </div>
+            <p style={{ fontSize: '0.74rem', color: 'var(--text-muted)', margin: '0 0 0.65rem 0', lineHeight: 1.4, fontWeight: 400 }}>
+              {t.studio.hwSubtitle}
+            </p>
+
+            <div className="hardware-custom-dropdown" style={{ position: 'relative' }}>
+              {/* Trigger Button */}
+              <button
+                type="button"
+                id="hardware-accel-select-trigger"
+                className={`hw-trigger-btn ${hwDropdownOpen ? 'open' : ''}`}
+                onClick={() => setHwDropdownOpen(!hwDropdownOpen)}
+                aria-haspopup="listbox"
+                aria-expanded={hwDropdownOpen}
+              >
+                <div className="hw-trigger-left">
+                  <span className="hw-trigger-badge">
+                    {hardwareAccel === 'client_gpu' ? 'GPU' : hardwareAccel === 'browser_wasm' ? 'WASM' : hardwareAccel.toUpperCase()}
+                  </span>
+                  <div className="hw-trigger-info">
+                    <span className="hw-trigger-name">
+                      {hardwareAccel === 'auto'
+                        ? t.studio.hwAuto
+                        : hardwareAccel === 'client_gpu'
+                        ? `Client GPU (${clientGpuName})`
+                        : hardwareAccel === 'browser_wasm'
+                        ? t.studio.hwWasm
+                        : hardwareAccel === 'nvenc'
+                        ? t.studio.hwNvenc
+                        : hardwareAccel === 'amf'
+                        ? t.studio.hwAmf
+                        : hardwareAccel === 'qsv'
+                        ? t.studio.hwQsv
+                        : t.studio.hwCpu}
+                    </span>
+                    <span className="hw-trigger-status-pill">
+                      {hardwareAccel === 'auto'
+                        ? (hardwareInfo?.recommended ? `[${t.studio.hwDetectedPill}: ${hardwareInfo.recommended.toUpperCase()}]` : `[${t.studio.hwDetectedPill}]`)
+                        : hardwareAccel === 'client_gpu'
+                        ? '[WebCodecs GPU Accel]'
+                        : hardwareAccel === 'browser_wasm'
+                        ? '[Client Engine]'
+                        : hardwareAccel === 'nvenc'
+                        ? (hardwareInfo?.support?.nvenc ? `[${t.studio.hwSupportedPill}]` : `[${t.studio.hwUnavailablePill}]`)
+                        : hardwareAccel === 'amf'
+                        ? (hardwareInfo?.support?.amf ? `[${t.studio.hwSupportedPill}]` : `[${t.studio.hwUnavailablePill}]`)
+                        : hardwareAccel === 'qsv'
+                        ? (hardwareInfo?.support?.qsv ? `[${t.studio.hwSupportedPill}]` : `[${t.studio.hwUnavailablePill}]`)
+                        : `[${t.studio.hwSupportedPill}]`}
+                    </span>
+                  </div>
+                </div>
+                <div className="hw-trigger-arrow">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ transform: hwDropdownOpen ? 'rotate(180deg)' : 'rotate(0deg)', transition: 'transform 0.2s ease' }}>
+                    <polyline points="6 9 12 15 18 9"></polyline>
+                  </svg>
+                </div>
+              </button>
+
+              {/* Dropdown Menu */}
+              {hwDropdownOpen && (
+                <>
+                  <div
+                    className="hw-dropdown-backdrop"
+                    onClick={() => setHwDropdownOpen(false)}
+                    style={{ position: 'fixed', inset: 0, zIndex: 99 }}
+                  />
+                  <div className="hw-dropdown-menu" role="listbox">
+                    {(isLocalhost
+                      ? [
+                          {
+                            value: 'auto' as HardwareAccelOption,
+                            badge: 'AUTO',
+                            title: t.studio.hwAuto,
+                            desc: hardwareInfo?.recommended ? `${t.studio.hwAutoDesc} · Recommended: ${hardwareInfo.recommended.toUpperCase()}` : t.studio.hwAutoDesc,
+                            status: hardwareInfo?.recommended ? `${t.studio.hwDetectedPill}: ${hardwareInfo.recommended.toUpperCase()}` : t.studio.hwDetectedPill,
+                            isReady: true,
+                            disabled: false,
+                          },
+                          ...(hasWebCodecs ? [{
+                            value: 'client_gpu' as HardwareAccelOption,
+                            badge: 'GPU',
+                            title: `Client GPU Acceleration (${clientGpuName})`,
+                            desc: 'Native WebCodecs VideoEncoder running directly on user GPU (0% Server CPU)',
+                            status: 'Client GPU Native',
+                            isReady: true,
+                            disabled: false,
+                          }] : []),
+                          {
+                            value: 'browser_wasm' as HardwareAccelOption,
+                            badge: 'WASM',
+                            title: t.studio.hwWasm,
+                            desc: t.studio.hwWasmDesc || 'Browser engine client-side (0% server CPU)',
+                            status: 'Client Engine',
+                            isReady: true,
+                            disabled: false,
+                          },
+                          {
+                            value: 'nvenc' as HardwareAccelOption,
+                            badge: 'NVENC',
+                            title: t.studio.hwNvenc,
+                            desc: t.studio.hwNvencDesc,
+                            status: hardwareInfo?.support?.nvenc ? t.studio.hwSupportedPill : t.studio.hwUnavailablePill,
+                            isReady: Boolean(hardwareInfo?.support?.nvenc),
+                            disabled: Boolean(hardwareInfo?.support && !hardwareInfo.support.nvenc),
+                          },
+                          {
+                            value: 'amf' as HardwareAccelOption,
+                            badge: 'AMF',
+                            title: t.studio.hwAmf,
+                            desc: t.studio.hwAmfDesc,
+                            status: hardwareInfo?.support?.amf ? t.studio.hwSupportedPill : t.studio.hwUnavailablePill,
+                            isReady: Boolean(hardwareInfo?.support?.amf),
+                            disabled: Boolean(hardwareInfo?.support && !hardwareInfo.support.amf),
+                          },
+                          {
+                            value: 'qsv' as HardwareAccelOption,
+                            badge: 'QSV',
+                            title: t.studio.hwQsv,
+                            desc: t.studio.hwQsvDesc,
+                            status: hardwareInfo?.support?.qsv ? t.studio.hwSupportedPill : t.studio.hwUnavailablePill,
+                            isReady: Boolean(hardwareInfo?.support?.qsv),
+                            disabled: Boolean(hardwareInfo?.support && !hardwareInfo.support.qsv),
+                          },
+                          {
+                            value: 'cpu' as HardwareAccelOption,
+                            badge: 'CPU',
+                            title: t.studio.hwCpu,
+                            desc: t.studio.hwCpuDesc,
+                            status: t.studio.hwSupportedPill,
+                            isReady: true,
+                            disabled: false,
+                          },
+                        ]
+                      : [
+                          ...(hasWebCodecs ? [{
+                            value: 'client_gpu' as HardwareAccelOption,
+                            badge: 'GPU',
+                            title: `Client GPU Acceleration (${clientGpuName})`,
+                            desc: 'WebCodecs GPU Hardware Encoder (0% Server CPU / RAM)',
+                            status: 'Client GPU Native',
+                            isReady: true,
+                            disabled: false,
+                          }] : []),
+                          {
+                            value: 'browser_wasm' as HardwareAccelOption,
+                            badge: 'WASM',
+                            title: t.studio.hwWasm || 'Browser Engine (WASM Fallback)',
+                            desc: 'Client-Side WebAssembly Software Engine (0% Server CPU / RAM)',
+                            status: 'Active Client Engine',
+                            isReady: true,
+                            disabled: false,
+                          },
+                        ]
+                    ).map((opt) => {
+                      const isSelected = hardwareAccel === opt.value;
+                      return (
+                        <div
+                          key={opt.value}
+                          className={`hw-dropdown-item ${isSelected ? 'active' : ''} ${opt.disabled ? 'disabled' : ''}`}
+                          onClick={() => {
+                            if (opt.disabled) return;
+                            setHardwareAccel(opt.value);
+                            setHwDropdownOpen(false);
+                          }}
+                          role="option"
+                          aria-selected={isSelected}
+                          aria-disabled={opt.disabled}
+                        >
+                          <div className="hw-item-left">
+                            <span className={`hw-item-badge ${opt.badge.toLowerCase()}`}>
+                              {opt.badge}
+                            </span>
+                            <div className="hw-item-text">
+                              <div className="hw-item-heading">
+                                <span className="hw-item-title">{opt.title}</span>
+                                <span className={`hw-status-pill ${opt.isReady ? 'ready' : 'unavailable'}`}>
+                                  [{opt.status}]
+                                </span>
+                              </div>
+                              <span className="hw-item-desc">{opt.desc}</span>
+                            </div>
+                          </div>
+                          {isSelected && (
+                            <span className="hw-item-selected-check">✓</span>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </>
+              )}
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', marginTop: '0.55rem', fontSize: '0.72rem', color: 'var(--text-muted)', fontWeight: 400 }}>
+                <span>
+                  {hardwareAccel === 'browser_wasm'
+                    ? (t.studio.hwWasmDesc || 'Client-side browser WASM engine (Zero server load · 100% private in browser)')
+                    : hardwareAccel === 'auto'
+                    ? (hardwareInfo?.recommended ? `${t.studio.hwAutoDesc} · Recommended: ${hardwareInfo.recommended.toUpperCase()}` : t.studio.hwAutoDesc)
+                    : hardwareAccel === 'nvenc'
+                    ? t.studio.hwNvencDesc
+                    : hardwareAccel === 'amf'
+                    ? t.studio.hwAmfDesc
+                    : hardwareAccel === 'qsv'
+                    ? t.studio.hwQsvDesc
+                    : t.studio.hwCpuDesc}
+                </span>
+              </div>
             </div>
           </div>
         </div>
@@ -3136,9 +4123,21 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                     {videoUrl && (videoUrl.endsWith('.mp4') || videoUrl.endsWith('.webm') || videoUrl.endsWith('.mov') || videoUrl.endsWith('.mkv') || videoUrl.includes('/api/video') || videoUrl.startsWith('blob:') || videoId?.startsWith('upload_') || videoId?.startsWith('gdrive_')) ? (
                       <video
                         ref={ambientVideoRef}
-                        src={videoUrl}
+                        src={videoUrl ? encodeURI(videoUrl) : `/api/video/${encodeURIComponent(videoId || '')}`}
                         playsInline
                         muted
+                        onError={(e) => {
+                          const vid = e.currentTarget;
+                          if (videoUrl?.startsWith('blob:')) {
+                            console.warn('Ambient blob video playback error:', e);
+                            return;
+                          }
+                          const fallback = `/api/video/${encodeURIComponent(videoId || '')}`;
+                          if (videoId && vid.src !== fallback && !vid.src.endsWith(fallback)) {
+                            vid.src = fallback;
+                            vid.load();
+                          }
+                        }}
                         style={{
                           width: '100%',
                           height: '100%',
@@ -3207,14 +4206,26 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                       {videoUrl && (videoUrl.endsWith('.mp4') || videoUrl.endsWith('.webm') || videoUrl.endsWith('.mov') || videoUrl.endsWith('.mkv') || videoUrl.includes('/api/video') || videoUrl.startsWith('blob:') || videoId?.startsWith('upload_') || videoId?.startsWith('gdrive_')) ? (
                         <video
                           ref={directVideoRef}
-                          src={videoUrl}
+                          src={videoUrl ? encodeURI(videoUrl) : `/api/video/${encodeURIComponent(videoId || '')}`}
                           playsInline
                           muted={isMuted}
+                          onError={(e) => {
+                            const vid = e.currentTarget;
+                            if (videoUrl?.startsWith('blob:')) {
+                              console.warn('Direct blob video playback error:', e);
+                              return;
+                            }
+                            const fallback = `/api/video/${encodeURIComponent(videoId || '')}`;
+                            if (videoId && vid.src !== fallback && !vid.src.endsWith(fallback)) {
+                              vid.src = fallback;
+                              vid.load();
+                            }
+                          }}
                           style={{
                             width: '100%',
                             height: '100%',
-                            objectFit: 'cover',
-                            objectPosition: `${previewCropPercent}% 50%`,
+                            objectFit: isLandscape || aspectRatio === '16:9' ? 'contain' : 'cover',
+                            objectPosition: isLandscape ? 'center center' : `${previewCropPercent}% 50%`,
                             transition: 'object-position 0.3s ease-out'
                           }}
                           onPlay={() => {
@@ -3277,14 +4288,14 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                             </svg>
                             <span className="pip-skeleton-text">CAM</span>
                           </div>
-                          <div className="wireframe-pip-badge">🔴 CAM</div>
+                          <div className="wireframe-pip-badge">[*] CAM</div>
                         </div>
                       )}
 
                       {/* Badge for Split Mode Bottom Feed */}
                       {streamerPreset === 'split_top_cam' && (
                         <div className="wireframe-gameplay-badge">
-                          🎮 GAMEPLAY ({aspectRatio})
+                          // GAMEPLAY ({aspectRatio})
                         </div>
                       )}
                     </div>
@@ -3297,28 +4308,19 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                     className="wireframe-title-overlay"
                     style={{
                       top: `${safeTitleY}%`,
-                      zIndex: 22,
+                      zIndex: 35,
                       pointerEvents: 'none',
                     }}
                   >
                     <span
                       className="wireframe-title-text"
                       style={{
-                        fontFamily: captionFont,
+                        fontFamily: `'${titleFont}', sans-serif`,
                         fontSize: (() => {
-                          const effectiveSize = titleFontSize || fontSize;
-                          if (isLandscape) {
-                            if (effectiveSize === 'small') return titleLineCount >= 3 ? '12px' : '14px';
-                            if (effectiveSize === 'big') return titleLineCount >= 3 ? '19px' : '22px';
-                            return titleLineCount >= 3 ? '15px' : '17.5px';
-                          }
-                          if (effectiveSize === 'small') {
-                            return titleLineCount >= 3 ? '14px' : '16.5px';
-                          }
-                          if (effectiveSize === 'big') {
-                            return titleLineCount >= 3 ? '22.5px' : '26px';
-                          }
-                          return titleLineCount >= 3 ? '18px' : '21px';
+                          const scale = isLandscape ? (320 / 1920) : (320 / 1080);
+                          const px = Math.round(titleFontSizePx * scale);
+                          const minPx = 4;
+                          return `${Math.max(minPx, px)}px`;
                         })(),
                         lineHeight: titleLineCount >= 3 ? 1.10 : 1.08,
                         letterSpacing: '0.02em',
@@ -3359,17 +4361,20 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                             top: 'auto',
                             transform: 'none',
                           }),
-                      zIndex: 22,
+                      zIndex: 35,
                       pointerEvents: 'none',
                     }}
                   >
                     <span
                       className="wireframe-caption-text"
                       style={{
-                        fontFamily: captionFont,
-                        fontSize: isLandscape
-                          ? (fontSize === 'small' ? '13px' : fontSize === 'big' ? '20px' : '16px')
-                          : (fontSize === 'small' ? '17px' : fontSize === 'big' ? '25px' : '20.5px'),
+                        fontFamily: `'${captionFont}', sans-serif`,
+                        fontSize: (() => {
+                          const scale = isLandscape ? (320 / 1920) : (320 / 1080);
+                          const px = Math.round(fontSizePx * scale);
+                          const minPx = 4;
+                          return `${Math.max(minPx, px)}px`;
+                        })(),
                         fontWeight: 800,
                         letterSpacing: '0.03em',
                         textAlign: 'center',
@@ -3496,6 +4501,9 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                   value={Math.min(Math.max(currentTime, clipStart), clipEnd)}
                   onChange={e => handleSeek(Number(e.target.value))}
                   title={t.studio.seekTimeline}
+                  style={{
+                    '--slider-progress': `${Math.max(0, Math.min(100, ((Math.min(Math.max(currentTime, clipStart), clipEnd) - clipStart) / (clipEnd - clipStart || 1)) * 100))}%`
+                  } as React.CSSProperties}
                 />
               </div>
 
@@ -3522,11 +4530,37 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
 
                   <button
                     type="button"
-                    className="player-ctrl-btn"
+                    className={`player-ctrl-btn ${isMuted ? 'active-mute' : ''}`}
                     onClick={toggleMute}
                     title={isMuted ? t.studio.unmute : t.studio.mute}
+                    style={{
+                      width: '30px',
+                      height: '30px',
+                      background: isMuted ? 'rgba(255, 0, 255, 0.15)' : '#060608',
+                      border: isMuted ? '1px solid #ff00ff' : '1px solid #201e2c',
+                      color: isMuted ? '#ff00ff' : '#ffffff',
+                      boxShadow: isMuted ? '0 0 8px rgba(255, 0, 255, 0.35)' : 'none',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      cursor: 'pointer',
+                      borderRadius: 0,
+                    }}
                   >
-                    {isMuted ? '🔇' : '🔊'}
+                    {isMuted ? (
+                      /* Audio Speaker Muted (Sound disabled) */
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                        <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+                        <line x1="23" y1="9" x2="17" y2="15"></line>
+                        <line x1="17" y1="9" x2="23" y2="15"></line>
+                      </svg>
+                    ) : (
+                      /* Audio Speaker Playing */
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                        <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+                        <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+                      </svg>
+                    )}
                   </button>
 
                   <span className="player-time-badge">
@@ -3537,11 +4571,29 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                 <div className="player-controls-right">
                   <button
                     type="button"
-                    className={`player-loop-toggle ${isLooping ? 'active' : ''}`}
+                    className={`player-ctrl-btn ${isLooping ? 'active' : ''}`}
                     onClick={() => setIsLooping(!isLooping)}
                     title={isLooping ? t.studio.loopEnabled : t.studio.loopDisabled}
+                    style={{
+                      width: '30px',
+                      height: '30px',
+                      background: isLooping ? 'rgba(255, 0, 255, 0.2)' : '#060608',
+                      border: isLooping ? '1px solid #ff00ff' : '1px solid #201e2c',
+                      color: isLooping ? '#ff00ff' : 'var(--text-muted)',
+                      boxShadow: isLooping ? '0 0 8px rgba(255, 0, 255, 0.45)' : 'none',
+                      cursor: 'pointer',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      borderRadius: 0,
+                    }}
                   >
-                    {t.studio.loop}
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                      <polyline points="17 1 21 5 17 9"></polyline>
+                      <path d="M3 11V9a4 4 0 0 1 4-4h14"></path>
+                      <polyline points="7 23 3 19 7 15"></polyline>
+                      <path d="M21 13v2a4 4 0 0 1-4 4H3"></path>
+                    </svg>
                   </button>
                 </div>
               </div>
@@ -3550,8 +4602,15 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
             <div className="studio-render-history-card">
               <div className="history-card-header">
                 <span className="history-card-title">{t.studio.renderSpecsTitle}</span>
-                <span className="history-badge-pill">
-                  {aspectRatio === '16:9' ? '1920×1080' : aspectRatio === '1:1' ? '1080×1080' : aspectRatio === '4:3' ? '1440×1080' : '1080×1920'}
+                <span className="history-badge-pill" style={{
+                  background: 'rgba(0, 229, 255, 0.15)',
+                  border: '1px solid #00e5ff',
+                  color: '#00e5ff',
+                  boxShadow: '0 0 8px rgba(0, 229, 255, 0.35)',
+                  fontWeight: 700,
+                  borderRadius: 0
+                }}>
+                  {aspectRatio === '16:9' || aspectRatio === '16:9_landscape' || aspectRatio === '4:3' ? '1920×1080' : aspectRatio === '1:1' ? '1080×1080' : '1080×1920'}
                 </span>
               </div>
 
@@ -3559,7 +4618,13 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                 <div className="history-info-item">
                   <span className="info-key">{t.studio.specResolution}</span>
                   <span className="info-val">
-                    {aspectRatio === '16:9' ? '1920×1080 (16:9 Landscape)' : aspectRatio === '1:1' ? '1080×1080 (1:1 Square)' : aspectRatio === '4:3' ? '1440×1080 (4:3 Classic)' : '1080×1920 (9:16 Portrait)'}
+                    {aspectRatio === '16:9' || aspectRatio === '16:9_landscape'
+                      ? '1920×1080 (16:9 Landscape)'
+                      : aspectRatio === '1:1'
+                      ? '1080×1080 (1:1 Square)'
+                      : aspectRatio === '4:3'
+                      ? '1920×1080 (4:3 Classic)'
+                      : '1080×1920 (9:16 Portrait)'}
                   </span>
                 </div>
                 <div className="history-info-item history-hardware-item">
@@ -3570,22 +4635,47 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                       value={hardwareAccel}
                       onChange={(e) => setHardwareAccel(e.target.value as HardwareAccelOption)}
                       title={t.studio.hwChangeHint}
+                      disabled={!isLocalhost}
                     >
-                      <option value="auto">
-                        ⚡ Auto ({hardwareInfo?.recommended ? hardwareInfo.recommended.toUpperCase() : 'NVENC'})
-                      </option>
-                      <option value="nvenc">
-                        🟢 NVENC {hardwareInfo?.support?.nvenc ? '✓' : ''}
-                      </option>
-                      <option value="amf">
-                        🔴 AMD AMF {hardwareInfo?.support?.amf ? '✓' : ''}
-                      </option>
-                      <option value="qsv">
-                        🔵 Intel QSV {hardwareInfo?.support?.qsv ? '✓' : ''}
-                      </option>
-                      <option value="cpu">
-                        ⚙️ CPU (libx264)
-                      </option>
+                      {isLocalhost ? (
+                        <>
+                          <option value="auto">
+                            {t.studio.hwAuto} ({t.studio.hwDetectedPill}
+                            {hardwareInfo?.recommended ? `: ${hardwareInfo.recommended.toUpperCase()}` : ''})
+                          </option>
+                          {hasWebCodecs && (
+                            <option value="client_gpu">
+                              [GPU] Client GPU Acceleration ({clientGpuName})
+                            </option>
+                          )}
+                          <option value="browser_wasm">
+                            [WASM] {t.studio.hwWasm || 'Browser Engine (Client-Side WASM · 0% Server CPU)'}
+                          </option>
+                          <option value="nvenc" disabled={hardwareInfo?.support && !hardwareInfo.support.nvenc}>
+                            {t.studio.hwNvenc} {hardwareInfo?.support?.nvenc ? `(${t.studio.hwSupportedPill})` : `(${t.studio.hwUnavailablePill})`}
+                          </option>
+                          <option value="amf" disabled={hardwareInfo?.support && !hardwareInfo.support.amf}>
+                            {t.studio.hwAmf} {hardwareInfo?.support?.amf ? `(${t.studio.hwSupportedPill})` : `(${t.studio.hwUnavailablePill})`}
+                          </option>
+                          <option value="qsv" disabled={hardwareInfo?.support && !hardwareInfo.support.qsv}>
+                            {t.studio.hwQsv} {hardwareInfo?.support?.qsv ? `(${t.studio.hwSupportedPill})` : `(${t.studio.hwUnavailablePill})`}
+                          </option>
+                          <option value="cpu">
+                            {t.studio.hwCpu} ({t.studio.hwSupportedPill})
+                          </option>
+                        </>
+                      ) : (
+                        <>
+                          {hasWebCodecs && (
+                            <option value="client_gpu">
+                              [GPU] Client GPU Acceleration ({clientGpuName})
+                            </option>
+                          )}
+                          <option value="browser_wasm">
+                            [WASM] Browser Engine (Client-Side · 0% Server CPU)
+                          </option>
+                        </>
+                      )}
                     </select>
                   </div>
                 </div>
@@ -3595,8 +4685,14 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                 </div>
                 <div className="history-info-item">
                   <span className="info-key">{t.studio.specCaption}</span>
-                  <span className="info-val">{captionStyle} · {captionFont}</span>
+                  <span className="info-val">{captionStyle} · {captionFont} ({fontSizePx}px)</span>
                 </div>
+                {titlePosition !== 'none' && (
+                  <div className="history-info-item">
+                    <span className="info-key">Title Font:</span>
+                    <span className="info-val">{titleFont} ({titleFontSizePx}px)</span>
+                  </div>
+                )}
                 <div className="history-info-item">
                   <span className="info-key">{t.studio.specQueue}</span>
                   <span className="info-val">{t.studio.specQueueVal(selectedClips.length, allClips.length)}</span>
@@ -3680,301 +4776,6 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                 </div>
               )}
             </div>
-
-            {/* Batch Render Queue Card - Fancy glowing when generating */}
-            {batchProgress && (
-              <div className={`studio-batch-queue-card ${batchProgress.overall_status === 'running' ? 'is-processing' : ''}`}>
-                <div className="batch-progress-header">
-                  <div>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                      <h4 className="batch-queue-title">{t.studio.batchQueueTitle}</h4>
-                      {batchProgress.overall_status === 'running' && (
-                        <span className="queue-generating-pill">
-                          <span className="queue-pulse-dot"></span> ⚡ GENERATING VIDEO...
-                        </span>
-                      )}
-                    </div>
-                    <p className="batch-subtitle">
-                      {batchProgress.overall_status === 'completed'
-                        ? (batchProgress.clips.some(c => c.status === 'error')
-                            ? t.studio.someClipsFailed(batchProgress.clips.filter(c => c.status === 'error').length, batchProgress.total_clips)
-                            : t.studio.allClipsRendered(batchProgress.total_clips))
-                        : batchProgress.overall_status === 'error'
-                        ? (batchProgress.error_message || t.studio.allClipsFailed)
-                        : t.studio.processingClip((batchProgress.current_clip_index || 0) + 1, batchProgress.total_clips)}
-                    </p>
-                  </div>
-
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
-                    {batchProgress.clips.some(c => c.status === 'error') && batchProgress.overall_status !== 'running' && onRetryClip && (
-                      <button
-                        type="button"
-                        onClick={() => onRetryClip()}
-                        style={{
-                          display: 'flex',
-                          alignItems: 'center',
-                          gap: '0.35rem',
-                          background: 'linear-gradient(135deg, #f59e0b 0%, #d97706 100%)',
-                          border: '1px solid rgba(245, 158, 11, 0.7)',
-                          color: '#ffffff',
-                          fontWeight: 700,
-                          fontSize: '0.72rem',
-                          padding: '0.3rem 0.65rem',
-                          borderRadius: '6px',
-                          cursor: 'pointer',
-                          boxShadow: '0 0 10px rgba(245, 158, 11, 0.35)',
-                          transition: 'all 0.2s ease',
-                        }}
-                        title="Retry all failed clips in this batch"
-                      >
-                        {t.studio.retryAllFailedBtn
-                          ? t.studio.retryAllFailedBtn(batchProgress.clips.filter(c => c.status === 'error').length)
-                          : `🔄 Retry Failed (${batchProgress.clips.filter(c => c.status === 'error').length})`}
-                      </button>
-                    )}
-
-                    {(batchProgress.overall_status === 'completed' || batchProgress.clips.some(c => c.status === 'completed')) && (
-                      <a
-                        href={batchProgress.zip_url || `/api/download-batch-zip/${batchProgress.batch_id}`}
-                        download={`cheat_clip_pro_${batchProgress.batch_id}.zip`}
-                        className="glowing-btn batch-zip-download-btn"
-                        style={{
-                          display: 'flex',
-                          alignItems: 'center',
-                          gap: '0.35rem',
-                          background: 'linear-gradient(135deg, #10b981 0%, #059669 100%)',
-                          border: '1px solid rgba(16, 185, 129, 0.6)',
-                          color: '#ffffff',
-                          fontWeight: 700,
-                          fontSize: '0.72rem',
-                          padding: '0.3rem 0.65rem',
-                          borderRadius: '6px',
-                          textDecoration: 'none',
-                          boxShadow: '0 0 12px rgba(16, 185, 129, 0.35)',
-                          cursor: 'pointer',
-                        }}
-                      >
-                        📦 ZIP
-                      </a>
-                    )}
-
-                    {(batchProgress.overall_status === 'completed' || batchProgress.overall_status === 'error') && onDismissProgress && (
-                      <button
-                        type="button"
-                        className="studio-close-btn"
-                        onClick={onDismissProgress}
-                        style={{ background: 'transparent', border: 'none', color: '#fff', cursor: 'pointer', fontSize: '1rem', padding: '0.1rem 0.3rem' }}
-                        title={t.studio.dismissQueue}
-                      >
-                        ✕
-                      </button>
-                    )}
-                  </div>
-                </div>
-
-                {/* Overall Batch Error Notice if all clips failed */}
-                {batchProgress.overall_status === 'error' && (
-                  <div style={{
-                    margin: '0.5rem 0 0.2rem',
-                    padding: '0.55rem 0.75rem',
-                    background: 'rgba(239, 68, 68, 0.12)',
-                    border: '1px solid rgba(239, 68, 68, 0.35)',
-                    borderRadius: '7px',
-                    color: '#fca5a5',
-                    fontSize: '0.74rem',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'space-between',
-                    gap: '0.45rem',
-                    fontWeight: 600
-                  }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
-                      <span>❌</span>
-                      <span>{batchProgress.error_message || t.studio.allClipsFailed}</span>
-                    </div>
-                    {onRetryClip && (
-                      <button
-                        type="button"
-                        onClick={() => onRetryClip()}
-                        style={{
-                          background: 'linear-gradient(135deg, #f59e0b, #d97706)',
-                          border: '1px solid rgba(245, 158, 11, 0.6)',
-                          color: '#fff',
-                          fontWeight: 700,
-                          fontSize: '0.7rem',
-                          padding: '3px 9px',
-                          borderRadius: '5px',
-                          cursor: 'pointer',
-                          boxShadow: '0 0 8px rgba(245, 158, 11, 0.35)',
-                          flexShrink: 0
-                        }}
-                      >
-                        {t.studio.retryClipBtn || '🔄 Retry'}
-                      </button>
-                    )}
-                  </div>
-                )}
-
-                {/* Overall Progress Bar */}
-                <div className="batch-overall-bar-wrap">
-                  <div className="batch-overall-bar" style={{ height: '5px', background: 'rgba(255,255,255,0.1)', borderRadius: '3px', overflow: 'hidden' }}>
-                    <div
-                      className="batch-overall-fill"
-                      style={{
-                        height: '100%',
-                        background: batchProgress.overall_status === 'error'
-                          ? '#ef4444'
-                          : 'linear-gradient(90deg, #ff5e3a, #ff2a5f)',
-                        width: `${Math.round((batchProgress.clips.filter(c => c.status === 'completed').length / (batchProgress.total_clips || 1)) * 100)}%`,
-                        transition: 'width 0.3s ease'
-                      }}
-                    ></div>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.68rem', color: 'var(--text-muted)', marginTop: '0.25rem' }}>
-                    <span>{t.batchProgress.completedMeta(batchProgress.clips.filter(c => c.status === 'completed').length, batchProgress.total_clips)}</span>
-                    <span>{Math.round((batchProgress.clips.filter(c => c.status === 'completed').length / (batchProgress.total_clips || 1)) * 100)}%</span>
-                  </div>
-                </div>
-
-                {/* Render Items List */}
-                <div className="batch-render-items-list" style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem', marginTop: '0.6rem' }}>
-                  {batchProgress.clips.map((clip, idx) => {
-                    let rawBaseTitle = (clip.base_title || '').trim();
-                    if (!rawBaseTitle) {
-                      let t = (clip.title || `clip_${idx + 1}`).trim();
-                      if (titlePrefix && t.startsWith(titlePrefix)) {
-                        t = t.slice(titlePrefix.length);
-                      }
-                      if (titleSuffix && t.endsWith(titleSuffix)) {
-                        t = t.slice(0, t.length - titleSuffix.length);
-                      }
-                      rawBaseTitle = t.trim() || `clip_${idx + 1}`;
-                    }
-                    rawBaseTitle = rawBaseTitle.replace(/[\\/*?:"<>|]/g, '').trim() || `clip_${idx + 1}`;
-                    const fnPfx = (fileNamePrefix || '').replace(/[\\/*?:"<>|]/g, '');
-                    const fnSfx = (fileNameSuffix || '').replace(/[\\/*?:"<>|]/g, '');
-                    const cleanTitle = `${fnPfx}${rawBaseTitle}${fnSfx}`.trim() || rawBaseTitle;
-                    let dupCount = 0;
-                    for (let i = 0; i < idx; i++) {
-                      let priorBase = (batchProgress.clips[i].base_title || '').trim();
-                      if (!priorBase) {
-                        let pt = (batchProgress.clips[i].title || `clip_${i + 1}`).trim();
-                        if (titlePrefix && pt.startsWith(titlePrefix)) {
-                          pt = pt.slice(titlePrefix.length);
-                        }
-                        if (titleSuffix && pt.endsWith(titleSuffix)) {
-                          pt = pt.slice(0, pt.length - titleSuffix.length);
-                        }
-                        priorBase = pt.trim() || `clip_${i + 1}`;
-                      }
-                      priorBase = priorBase.replace(/[\\/*?:"<>|]/g, '').trim() || `clip_${i + 1}`;
-                      const priorTitle = `${fnPfx}${priorBase}${fnSfx}`.trim() || priorBase;
-                      if (priorTitle.toLowerCase() === cleanTitle.toLowerCase()) {
-                        dupCount++;
-                      }
-                    }
-                    const finalClipName = dupCount > 0 ? `${cleanTitle} (${dupCount})` : cleanTitle;
-                    const dlUrlWithTitle = clip.download_url
-                      ? `${clip.download_url}${clip.download_url.includes('?') ? '&' : '?'}title=${encodeURIComponent(finalClipName)}`
-                      : '';
-
-                    const isError = clip.status === 'error';
-                    const rawError = clip.error_message || clip.error || '';
-
-                    return (
-                      <div
-                        key={idx}
-                        className={`batch-item-row status-${clip.status}`}
-                        style={{
-                          padding: '0.5rem 0.75rem',
-                          borderRadius: '8px',
-                          background: isError ? 'rgba(239, 68, 68, 0.05)' : 'rgba(255,255,255,0.03)',
-                          border: isError ? '1px solid rgba(239, 68, 68, 0.3)' : '1px solid rgba(255,255,255,0.06)',
-                          display: 'flex',
-                          flexDirection: 'column',
-                          gap: '0.25rem',
-                        }}
-                      >
-                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%' }}>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', maxWidth: '65%' }}>
-                            <span style={{ fontSize: '0.7rem', color: isError ? '#f87171' : 'var(--text-muted)', fontWeight: 600 }}>#{idx + 1}</span>
-                            <span style={{ fontSize: '0.75rem', color: '#fff', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{clip.title}</span>
-                          </div>
-                          <div>
-                            {clip.status === 'pending' && <span style={{ fontSize: '0.68rem', color: 'var(--text-muted)' }}>{t.studio.statusWaitingShort}</span>}
-                            {clip.status === 'downloading' && <span style={{ fontSize: '0.68rem', color: '#f59e0b' }}>{t.studio.statusSlicingShort}</span>}
-                            {clip.status === 'transcribing' && <span style={{ fontSize: '0.68rem', color: '#8b5cf6' }}>{t.studio.statusCaptionsShort}</span>}
-                            {clip.status === 'rendering' && <span style={{ fontSize: '0.68rem', color: '#3b82f6' }}>{t.studio.statusRenderingShort}</span>}
-                            {clip.status === 'completed' && (
-                              clip.download_url ? (
-                                <a
-                                  href={dlUrlWithTitle}
-                                  download={`${finalClipName}.mp4`}
-                                  className="quick-dl-btn"
-                                  title={`Download ${finalClipName}.mp4`}
-                                >
-                                  ⬇️ MP4
-                                </a>
-                              ) : (
-                                <span className="quick-dl-btn" style={{ background: 'rgba(16, 185, 129, 0.15)', color: '#10b981' }}>
-                                  ✓ Done
-                                </span>
-                              )
-                            )}
-                            {isError && (
-                              <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
-                                <span
-                                  style={{
-                                    fontSize: '0.68rem',
-                                    fontWeight: 700,
-                                    color: '#f87171',
-                                    background: 'rgba(239, 68, 68, 0.18)',
-                                    padding: '2px 8px',
-                                    borderRadius: '4px',
-                                    border: '1px solid rgba(239, 68, 68, 0.35)',
-                                  }}
-                                >
-                                  ❌ {t.studio.statusFailedShort}
-                                </span>
-                                {onRetryClip && batchProgress.overall_status !== 'running' && (
-                                  <button
-                                    type="button"
-                                    onClick={() => onRetryClip(idx)}
-                                    style={{
-                                      background: 'rgba(245, 158, 11, 0.18)',
-                                      border: '1px solid rgba(245, 158, 11, 0.5)',
-                                      borderRadius: '4px',
-                                      color: '#fbbf24',
-                                      fontSize: '0.68rem',
-                                      fontWeight: 700,
-                                      padding: '2px 8px',
-                                      cursor: 'pointer',
-                                      transition: 'all 0.2s ease',
-                                    }}
-                                    title="Retry rendering this clip"
-                                  >
-                                    {t.studio.retryClipBtn || '🔄 Retry'}
-                                  </button>
-                                )}
-                              </div>
-                            )}
-                          </div>
-                        </div>
-
-                        {/* Visible Error Box when clip fails */}
-                        {isError && rawError && (
-                          <ClipRenderErrorBox
-                            errorMessage={rawError}
-                            t={t}
-                            onRetry={onRetryClip && batchProgress.overall_status !== 'running' ? () => onRetryClip(idx) : undefined}
-                          />
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
           </div>
         </div>
       </div>
@@ -3986,36 +4787,85 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
             <span className="meta-badge">
               {t.studio.readyToRenderMeta(selectedClips.length)}
             </span>
-            <button
-              type="button"
-              className="studio-clear-temp-btn"
-              title={t.studio.clearTempTooltip}
-              onClick={handleClearTempClick}
-              disabled={isClearingTemp}
-              style={{
-                background: 'rgba(255, 255, 255, 0.07)',
-                border: '1px solid rgba(255, 255, 255, 0.15)',
-                color: 'var(--text-secondary)',
-                fontSize: '0.72rem',
-                fontWeight: 600,
-                padding: '0.2rem 0.55rem',
-                borderRadius: '6px',
-                cursor: 'pointer',
-                transition: 'all 0.15s ease',
-              }}
-            >
-              {isClearingTemp ? t.studio.clearingTempBtn : t.studio.clearTempBtn}
-            </button>
-            {tempClearMsg && (
-              <span style={{ fontSize: '0.72rem', color: '#4ade80', fontWeight: 600 }}>
-                {tempClearMsg}
-              </span>
+            {allowAppUpdates && (
+              <>
+                <button
+                  type="button"
+                  className="studio-clear-temp-btn"
+                  title={t.studio.clearTempTooltip}
+                  onClick={handleClearTempClick}
+                  disabled={isClearingTemp}
+                  style={{
+                    background: 'rgba(255, 255, 255, 0.07)',
+                    border: '1px solid rgba(255, 255, 255, 0.15)',
+                    color: 'var(--text-secondary)',
+                    fontSize: '0.72rem',
+                    fontWeight: 600,
+                    padding: '0.2rem 0.55rem',
+                    borderRadius: '6px',
+                    cursor: 'pointer',
+                    transition: 'all 0.15s ease',
+                  }}
+                >
+                  {isClearingTemp ? t.studio.clearingTempBtn : t.studio.clearTempBtn}
+                </button>
+                {tempClearMsg && (
+                  <span style={{ fontSize: '0.72rem', color: '#4ade80', fontWeight: 600 }}>
+                    {tempClearMsg}
+                  </span>
+                )}
+              </>
             )}
           </div>
           <span className="meta-sub">
             {t.studio.outputMetaSub}
           </span>
         </div>
+
+        {!hasCookies && isYouTube && (
+          <div
+            className="studio-cookie-warning-banner"
+            onClick={onOpenCookiesModal}
+            style={{
+              width: '100%',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: '0.75rem',
+              padding: '0.7rem 1.1rem',
+              borderRadius: '9px',
+              background: 'linear-gradient(135deg, rgba(245, 158, 11, 0.12) 0%, rgba(217, 119, 6, 0.06) 100%)',
+              border: '1px solid rgba(245, 158, 11, 0.35)',
+              cursor: onOpenCookiesModal ? 'pointer' : 'default',
+              margin: '0.65rem 0',
+              transition: 'all 0.15s ease',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.55rem', textAlign: 'left' }}>
+              <span style={{ fontSize: '1.15rem' }}>[!]</span>
+              <span style={{ fontSize: '0.79rem', color: '#fbbf24', fontWeight: 500, lineHeight: 1.4 }}>
+                {t.cookieWarning.studioBannerWarning}
+              </span>
+            </div>
+            {onOpenCookiesModal && (
+              <span
+                style={{
+                  fontSize: '0.76rem',
+                  fontWeight: 700,
+                  color: '#34d399',
+                  background: 'rgba(16, 185, 129, 0.15)',
+                  border: '1px solid rgba(16, 185, 129, 0.35)',
+                  padding: '0.25rem 0.65rem',
+                  borderRadius: '6px',
+                  whiteSpace: 'nowrap',
+                  flexShrink: 0,
+                }}
+              >
+                {t.cookieWarning.studioBannerAction} →
+              </span>
+            )}
+          </div>
+        )}
 
         <button
           className="studio-btn-render glowing-btn big-render-cta"
@@ -4028,6 +4878,8 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
             <>{t.studio.launchingRenderBtn}</>
           ) : selectedClips.length === 0 ? (
             <>{t.studio.selectClipWarning}</>
+          ) : renderMode === 'merged' ? (
+            <>{t.studio.mergedRenderCta(selectedClips.length, totalSelectedDuration)}</>
           ) : (
             <>
               {t.studio.batchRenderCta(selectedClips.length)}
@@ -4036,12 +4888,319 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
         </button>
       </div>
 
+      {/* Batch Render Queue & Results Dashboard Card - Located below bottom action bar */}
+      {batchProgress && (
+        <div className={`bottom-batch-dashboard-card ${batchProgress.overall_status === 'running' ? 'is-processing' : ''}`}>
+          <div className="batch-progress-header">
+            <div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                <h4 className="batch-queue-title">{t.studio.batchQueueTitle}</h4>
+                {batchProgress.overall_status === 'running' && (
+                  <span className="queue-generating-pill">
+                    <span className="queue-pulse-dot"></span> * GENERATING VIDEO...
+                  </span>
+                )}
+              </div>
+              <p className="batch-subtitle">
+                {batchProgress.overall_status === 'completed'
+                  ? (batchProgress.clips.some(c => c.status === 'error')
+                      ? t.studio.someClipsFailed(batchProgress.clips.filter(c => c.status === 'error').length, batchProgress.total_clips)
+                      : t.studio.allClipsRendered(batchProgress.total_clips))
+                  : batchProgress.overall_status === 'error'
+                  ? (batchProgress.error_message || t.studio.allClipsFailed)
+                  : t.studio.processingClip((batchProgress.current_clip_index || 0) + 1, batchProgress.total_clips)}
+              </p>
+            </div>
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
+              {batchProgress.clips.some(c => c.status === 'error') && batchProgress.overall_status !== 'running' && onRetryClip && (
+                <button
+                  type="button"
+                  onClick={() => onRetryClip()}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '0.35rem',
+                    background: 'linear-gradient(135deg, #f59e0b 0%, #d97706 100%)',
+                    border: '1px solid rgba(245, 158, 11, 0.7)',
+                    color: '#ffffff',
+                    fontWeight: 700,
+                    fontSize: '0.72rem',
+                    padding: '0.3rem 0.65rem',
+                    borderRadius: '6px',
+                    cursor: 'pointer',
+                    boxShadow: '0 0 10px rgba(245, 158, 11, 0.35)',
+                    transition: 'all 0.2s ease',
+                  }}
+                  title="Retry all failed clips in this batch"
+                >
+                  {t.studio.retryAllFailedBtn
+                    ? t.studio.retryAllFailedBtn(batchProgress.clips.filter(c => c.status === 'error').length)
+                    : `[~] Retry Failed (${batchProgress.clips.filter(c => c.status === 'error').length})`}
+                </button>
+              )}
+
+              {(batchProgress.overall_status === 'completed' || batchProgress.clips.some(c => c.status === 'completed')) && (
+                <a
+                  href={batchProgress.zip_url || `/api/download-batch-zip/${batchProgress.batch_id}`}
+                  download={`cheat_clip_pro_${batchProgress.batch_id}.zip`}
+                  className="glowing-btn batch-zip-download-btn"
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '0.35rem',
+                    background: 'linear-gradient(135deg, #10b981 0%, #059669 100%)',
+                    border: '1px solid rgba(16, 185, 129, 0.6)',
+                    color: '#ffffff',
+                    fontWeight: 700,
+                    fontSize: '0.72rem',
+                    padding: '0.3rem 0.65rem',
+                    borderRadius: '6px',
+                    textDecoration: 'none',
+                    boxShadow: '0 0 12px rgba(16, 185, 129, 0.35)',
+                    cursor: 'pointer',
+                  }}
+                >
+                  [PKG] ZIP
+                </a>
+              )}
+
+              {(batchProgress.overall_status === 'completed' || batchProgress.overall_status === 'error') && onDismissProgress && (
+                <button
+                  type="button"
+                  className="studio-close-btn"
+                  onClick={onDismissProgress}
+                  style={{ background: 'transparent', border: 'none', color: '#fff', cursor: 'pointer', fontSize: '1rem', padding: '0.1rem 0.3rem' }}
+                  title={t.studio.dismissQueue}
+                >
+                  ✕
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Overall Batch Error Notice if all clips failed */}
+          {batchProgress.overall_status === 'error' && (
+            <div style={{
+              margin: '0.5rem 0 0.2rem',
+              padding: '0.55rem 0.75rem',
+              background: 'rgba(255, 30, 39, 0.12)',
+              border: '1px solid #ff1e27',
+              borderRadius: 0,
+              color: '#fca5a5',
+              fontSize: '0.74rem',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: '0.45rem',
+              fontWeight: 600,
+              boxShadow: '0 0 10px rgba(255, 30, 39, 0.25)'
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
+                <AlertTriangle size={15} color="#ff1e27" />
+                <span style={{ color: '#fff', fontWeight: 700 }}>{batchProgress.error_message || t.studio.allClipsFailed}</span>
+              </div>
+              {onRetryClip && (
+                <button
+                  type="button"
+                  onClick={() => onRetryClip()}
+                  style={{
+                    background: 'linear-gradient(135deg, #f59e0b, #d97706)',
+                    border: '1px solid rgba(245, 158, 11, 0.6)',
+                    color: '#fff',
+                    fontWeight: 700,
+                    fontSize: '0.7rem',
+                    padding: '3px 9px',
+                    borderRadius: 0,
+                    cursor: 'pointer',
+                    boxShadow: '0 0 8px rgba(245, 158, 11, 0.35)',
+                    flexShrink: 0,
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '0.25rem'
+                  }}
+                >
+                  <RefreshCw size={11} />
+                  {t.studio.retryClipBtn || 'Retry'}
+                </button>
+              )}
+            </div>
+          )}
+
+          {/* Overall Progress Bar */}
+          <div className="batch-overall-bar-wrap">
+            <div className="batch-overall-bar" style={{ height: '5px', background: 'rgba(255,255,255,0.1)', borderRadius: '3px', overflow: 'hidden' }}>
+              <div
+                className="batch-overall-fill"
+                style={{
+                  height: '100%',
+                  background: batchProgress.overall_status === 'error'
+                    ? '#ef4444'
+                    : 'linear-gradient(90deg, #ff5e3a, #ff2a5f)',
+                  width: `${Math.round((batchProgress.clips.filter(c => c.status === 'completed').length / (batchProgress.total_clips || 1)) * 100)}%`,
+                  transition: 'width 0.3s ease'
+                }}
+              ></div>
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.68rem', color: 'var(--text-muted)', marginTop: '0.25rem' }}>
+              <span>{t.batchProgress.completedMeta(batchProgress.clips.filter(c => c.status === 'completed').length, batchProgress.total_clips)}</span>
+              <span>{Math.round((batchProgress.clips.filter(c => c.status === 'completed').length / (batchProgress.total_clips || 1)) * 100)}%</span>
+            </div>
+          </div>
+
+          {/* Render Items List */}
+          <div className="batch-render-items-list" style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem', marginTop: '0.6rem' }}>
+            {batchProgress.clips.map((clip, idx) => {
+              let rawBaseTitle = (clip.base_title || '').trim();
+              if (!rawBaseTitle) {
+                let t = (clip.title || `clip_${idx + 1}`).trim();
+                if (titlePrefix && t.startsWith(titlePrefix)) {
+                  t = t.slice(titlePrefix.length);
+                }
+                if (titleSuffix && t.endsWith(titleSuffix)) {
+                  t = t.slice(0, t.length - titleSuffix.length);
+                }
+                rawBaseTitle = t.trim() || `clip_${idx + 1}`;
+              }
+              rawBaseTitle = rawBaseTitle.replace(/[\\/*?:"<>|]/g, '').trim() || `clip_${idx + 1}`;
+              const fnPfx = (fileNamePrefix || '').replace(/[\\/*?:"<>|]/g, '');
+              const fnSfx = (fileNameSuffix || '').replace(/[\\/*?:"<>|]/g, '');
+              const cleanTitle = `${fnPfx}${rawBaseTitle}${fnSfx}`.trim() || rawBaseTitle;
+              let dupCount = 0;
+              for (let i = 0; i < idx; i++) {
+                let priorBase = (batchProgress.clips[i].base_title || '').trim();
+                if (!priorBase) {
+                  let pt = (batchProgress.clips[i].title || `clip_${i + 1}`).trim();
+                  if (titlePrefix && pt.startsWith(titlePrefix)) {
+                    pt = pt.slice(titlePrefix.length);
+                  }
+                  if (titleSuffix && pt.endsWith(titleSuffix)) {
+                    pt = pt.slice(0, pt.length - titleSuffix.length);
+                  }
+                  priorBase = pt.trim() || `clip_${i + 1}`;
+                }
+                priorBase = priorBase.replace(/[\\/*?:"<>|]/g, '').trim() || `clip_${i + 1}`;
+                const priorTitle = `${fnPfx}${priorBase}${fnSfx}`.trim() || priorBase;
+                if (priorTitle.toLowerCase() === cleanTitle.toLowerCase()) {
+                  dupCount++;
+                }
+              }
+              const finalClipName = dupCount > 0 ? `${cleanTitle} (${dupCount})` : cleanTitle;
+              const dlUrlWithTitle = clip.download_url
+                ? `${clip.download_url}${clip.download_url.includes('?') ? '&' : '?'}title=${encodeURIComponent(finalClipName)}`
+                : '';
+
+              const isError = clip.status === 'error';
+              const rawError = clip.error_message || clip.error || '';
+
+              return (
+                <div
+                  key={idx}
+                  className={`batch-item-row status-${clip.status}`}
+                  style={{
+                    padding: '0.5rem 0.75rem',
+                    borderRadius: '8px',
+                    background: isError ? 'rgba(239, 68, 68, 0.05)' : 'rgba(255,255,255,0.03)',
+                    border: isError ? '1px solid rgba(239, 68, 68, 0.3)' : '1px solid rgba(255,255,255,0.06)',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '0.25rem',
+                  }}
+                >
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', maxWidth: '65%' }}>
+                      <span style={{ fontSize: '0.7rem', color: isError ? '#f87171' : 'var(--text-muted)', fontWeight: 600 }}>#{idx + 1}</span>
+                      <span style={{ fontSize: '0.75rem', color: '#fff', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{clip.title}</span>
+                    </div>
+                    <div>
+                      {clip.status === 'pending' && <span style={{ fontSize: '0.68rem', color: 'var(--text-muted)' }}>{t.studio.statusWaitingShort}</span>}
+                      {clip.status === 'downloading' && <span style={{ fontSize: '0.68rem', color: '#f59e0b' }}>{t.studio.statusSlicingShort}</span>}
+                      {clip.status === 'transcribing' && <span style={{ fontSize: '0.68rem', color: '#8b5cf6' }}>{t.studio.statusCaptionsShort}</span>}
+                      {clip.status === 'rendering' && <span style={{ fontSize: '0.68rem', color: '#3b82f6' }}>{t.studio.statusRenderingShort}</span>}
+                      {clip.status === 'completed' && (
+                        clip.download_url ? (
+                          <a
+                            href={dlUrlWithTitle}
+                            download={`${finalClipName}.mp4`}
+                            className="quick-dl-btn"
+                            title={`Download ${finalClipName}.mp4`}
+                          >
+                            ⬇️ MP4
+                          </a>
+                        ) : (
+                          <span className="quick-dl-btn" style={{ background: 'rgba(16, 185, 129, 0.15)', color: '#10b981' }}>
+                            ✓ Done
+                          </span>
+                        )
+                      )}
+                      {isError && (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+                          <span
+                            style={{
+                              fontSize: '0.68rem',
+                              fontWeight: 800,
+                              color: '#ff1e27',
+                              background: 'rgba(255, 30, 39, 0.15)',
+                              padding: '2px 8px',
+                              borderRadius: 0,
+                              border: '1px solid #ff1e27',
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              gap: '0.25rem'
+                            }}
+                          >
+                            <X size={11} /> {t.studio.statusFailedShort}
+                          </span>
+                          {onRetryClip && batchProgress.overall_status !== 'running' && (
+                            <button
+                              type="button"
+                              onClick={() => onRetryClip(idx)}
+                              style={{
+                                background: 'rgba(245, 158, 11, 0.18)',
+                                border: '1px solid rgba(245, 158, 11, 0.5)',
+                                borderRadius: 0,
+                                color: '#fbbf24',
+                                fontSize: '0.68rem',
+                                fontWeight: 700,
+                                padding: '2px 8px',
+                                cursor: 'pointer',
+                                transition: 'all 0.2s ease',
+                                display: 'inline-flex',
+                                alignItems: 'center',
+                                gap: '0.25rem'
+                              }}
+                              title="Retry rendering this clip"
+                            >
+                              <RefreshCw size={11} />
+                              {t.studio.retryClipBtn || 'Retry'}
+                            </button>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Visible Error Box when clip fails */}
+                  {isError && rawError && (
+                    <ClipRenderErrorBox
+                      errorMessage={rawError}
+                      t={t}
+                      onRetry={onRetryClip && batchProgress.overall_status !== 'running' ? () => onRetryClip(idx) : undefined}
+                    />
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       {/* Custom Clear Temp Confirmation Modal */}
       {showClearConfirmModal && (
         <div className="custom-confirm-modal-overlay">
           <div className="custom-confirm-modal-card">
-            <div className="confirm-modal-icon-wrap">
-              🧹
+            <div className="confirm-modal-icon-wrap" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+              <Trash2 size={24} color="#ff1e27" />
             </div>
             <h3 className="confirm-modal-title">{t.studio.confirmModalTitle}</h3>
             <p className="confirm-modal-desc" style={{ marginBottom: '1rem' }}>
@@ -4065,7 +5224,7 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                 <strong>{t.studio.confirmModalNotice}</strong>
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', color: '#38bdf8' }}>
-                <span>🛡️</span>
+                <span>[SEC]</span>
                 <strong>{t.studio.confirmModalCookieNotice}</strong>
               </div>
             </div>

@@ -49,18 +49,24 @@ load_dotenv()
 
 ROOT_DIR = Path(_base_dir).parent
 
-# Setup logging
+# Setup logging with security redactor
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("cheat-clip-pro")
+
+from backend.security import install_security_logging
+install_security_logging()
 
 
 try:
     from backend.video_engine import (
         TEMP_DIR,
         EXPORTS_DIR,
+        FONTS_DIR,
         COOKIES_PATH,
         ROOT_COOKIES_PATH,
         get_effective_cookies_path,
+        ephemeral_cookies_file,
+        normalize_to_netscape,
         ACTIVE_ENCODER_NAME,
         ACTIVE_ENCODER_ARGS,
         detect_hardware_support,
@@ -70,6 +76,8 @@ try:
         transcribe_clip_words,
         has_emoji,
         render_title_overlay_png,
+        render_text_watermark_png,
+        get_ffmpeg_safe_font_path,
         generate_ass_file,
         render_clip_to_mp4,
         extract_clip_frame,
@@ -82,9 +90,12 @@ except ImportError:
     from video_engine import (
         TEMP_DIR,
         EXPORTS_DIR,
+        FONTS_DIR,
         COOKIES_PATH,
         ROOT_COOKIES_PATH,
         get_effective_cookies_path,
+        ephemeral_cookies_file,
+        normalize_to_netscape,
         ACTIVE_ENCODER_NAME,
         ACTIVE_ENCODER_ARGS,
         detect_hardware_support,
@@ -94,6 +105,8 @@ except ImportError:
         transcribe_clip_words,
         has_emoji,
         render_title_overlay_png,
+        render_text_watermark_png,
+        get_ffmpeg_safe_font_path,
         generate_ass_file,
         render_clip_to_mp4,
         extract_clip_frame,

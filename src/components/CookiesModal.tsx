@@ -1,6 +1,18 @@
 import React, { useState, useEffect } from 'react';
+import { ShieldCheck, AlertTriangle, Shield, Trash2, X } from 'lucide-react';
 import { useLanguage } from '../locales';
-import { resilientFetch } from '../utils/api';
+import {
+  getStoredCookies,
+  setStoredCookies,
+  removeStoredCookies,
+  hasStoredCookies,
+  getStoredCookiesSize,
+  getCookieDomainSamples,
+  normalizeCookies,
+  countValidCookies,
+  hasValidCookieLines,
+} from '../utils/cookieUtils';
+import styles from './CookiesModal.module.css';
 
 interface CookiesModalProps {
   isOpen: boolean;
@@ -15,38 +27,35 @@ export const CookiesModal: React.FC<CookiesModalProps> = ({
 }) => {
   const { t } = useLanguage();
   const [cookieText, setCookieText] = useState<string>('');
-  const [hasCookies, setHasCookies] = useState<boolean>(false);
+  const [isCookieActive, setIsCookieActive] = useState<boolean>(false);
   const [cookieSize, setCookieSize] = useState<number>(0);
+  const [cookieCount, setCookieCount] = useState<number>(0);
   const [sampleLines, setSampleLines] = useState<string[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [message, setMessage] = useState<{ text: string; type: 'success' | 'error' | 'info' } | null>(null);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState<boolean>(false);
 
-  const fetchStatus = async () => {
-    try {
-      const res = await resilientFetch('/api/cookies', { maxRetries: 3, retryDelay: 800, silent: true });
-      if (res.ok) {
-        const data = await res.json();
-        setHasCookies(data.exists);
-        setCookieSize(data.size || 0);
-        setSampleLines(data.sample_lines || []);
-        if (data.cookies_content) {
-          setCookieText(data.cookies_content);
-        } else if (!data.exists) {
-          setCookieText('');
-        }
-        if (onCookieStatusChange) {
-          onCookieStatusChange(data.exists);
-        }
-      }
-    } catch {
-      // Backend might not be reachable yet
+  const loadStatus = () => {
+    const raw = getStoredCookies();
+    const active = hasStoredCookies();
+    const size = getStoredCookiesSize();
+    const count = countValidCookies(raw);
+    const samples = getCookieDomainSamples(raw);
+
+    setIsCookieActive(active);
+    setCookieSize(size);
+    setCookieCount(count);
+    setSampleLines(samples);
+    setCookieText(raw);
+
+    if (onCookieStatusChange) {
+      onCookieStatusChange(active);
     }
   };
 
   useEffect(() => {
     if (isOpen) {
-      fetchStatus();
+      loadStatus();
       setMessage(null);
     }
   }, [isOpen]);
@@ -71,12 +80,25 @@ export const CookiesModal: React.FC<CookiesModalProps> = ({
       }
       try {
         const decoder = new TextDecoder(encoding);
-        let content = decoder.decode(bytes).replace(/\ufeff/g, '').replace(/\0/g, '');
+        const content = decoder.decode(bytes).replace(/\ufeff/g, '').replace(/\0/g, '');
         setCookieText(content);
-        setMessage({
-          text: t.cookies.fileLoadedInfo(file.name, (content.length / 1024).toFixed(1)),
-          type: 'info'
-        });
+
+        // Auto-save and activate the cookies immediately upon uploading/dropping file!
+        const normalized = normalizeCookies(content);
+        if (hasValidCookieLines(normalized)) {
+          setStoredCookies(normalized);
+          loadStatus();
+          const validNum = countValidCookies(normalized);
+          setMessage({
+            text: t.cookies.fileLoadedAndSaved(file.name, validNum),
+            type: 'success'
+          });
+        } else {
+          setMessage({
+            text: t.cookies.fileLoadedInfo(file.name, (content.length / 1024).toFixed(1)),
+            type: 'info'
+          });
+        }
       } catch (err: any) {
         setMessage({ text: `Failed to read file: ${err.message}`, type: 'error' });
       }
@@ -89,49 +111,42 @@ export const CookiesModal: React.FC<CookiesModalProps> = ({
     if (file) readFileContent(file);
   };
 
-  const handleSave = async () => {
+  const handleSave = () => {
     if (!cookieText.trim()) {
       setMessage({ text: t.cookies.emptyError, type: 'error' });
       return;
     }
     setIsLoading(true);
     setMessage(null);
+
     try {
-      const res = await fetch('/api/cookies', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ cookies_content: cookieText }),
-      });
-      const data = await res.json();
-      if (res.ok && data.success) {
-        setMessage({ text: t.cookies.saveSuccess, type: 'success' });
-        fetchStatus();
-      } else {
-        setMessage({ text: data.detail || t.cookies.saveFailed, type: 'error' });
+      const normalized = normalizeCookies(cookieText);
+      if (!normalized || !hasValidCookieLines(normalized)) {
+        setMessage({ text: t.cookies.emptyError, type: 'error' });
+        setIsLoading(false);
+        return;
       }
+
+      setStoredCookies(normalized);
+      loadStatus();
+      setMessage({ text: t.cookies.saveSuccess, type: 'success' });
     } catch (err: any) {
-      setMessage({ text: err.message || t.cookies.networkError, type: 'error' });
+      setMessage({ text: err.message || t.cookies.saveFailed, type: 'error' });
     } finally {
       setIsLoading(false);
     }
   };
 
-  const executeDeleteCookies = async () => {
+  const executeDeleteCookies = () => {
     setIsLoading(true);
     setMessage(null);
     try {
-      const res = await fetch('/api/cookies', {
-        method: 'DELETE',
-      });
-      const data = await res.json();
-      if (res.ok && data.success) {
-        setMessage({ text: t.cookies.deletedSuccess, type: 'info' });
-        fetchStatus();
-      } else {
-        setMessage({ text: data.detail || t.cookies.removeFailed, type: 'error' });
-      }
+      removeStoredCookies();
+      fetch('/api/cookies', { method: 'DELETE' }).catch(() => {});
+      loadStatus();
+      setMessage({ text: t.cookies.deletedSuccess, type: 'info' });
     } catch (err: any) {
-      setMessage({ text: err.message || t.cookies.networkError, type: 'error' });
+      setMessage({ text: err.message || t.cookies.removeFailed, type: 'error' });
     } finally {
       setIsLoading(false);
       setShowDeleteConfirm(false);
@@ -140,44 +155,55 @@ export const CookiesModal: React.FC<CookiesModalProps> = ({
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
-      <div className="cookies-modal-card" onClick={(e) => e.stopPropagation()}>
+      <div className={styles.card} onClick={(e) => e.stopPropagation()}>
         {/* Header */}
-        <div className="studio-modal-header">
-          <div className="studio-header-title">
-            <div className="studio-icon-badge">🍪</div>
+        <div className={styles.header}>
+          <div className={styles.headerLeft}>
+            <div className={styles.iconBadge} style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+              <ShieldCheck size={20} color="var(--primary)" />
+            </div>
             <div>
-              <div className="studio-title-row">
-                <h2>{t.cookies.modalTitle}</h2>
-                <span className={`status-pill ${hasCookies ? 'active' : 'inactive'}`}>
-                  {hasCookies ? t.cookies.statusActive : t.cookies.statusInactive}
+              <div className={styles.titleRow}>
+                <h2 className={styles.title}>{t.cookies.modalTitle}</h2>
+                <span className={`${styles.statusPill} ${isCookieActive ? styles.statusActive : styles.statusInactive}`}>
+                  {isCookieActive ? t.cookies.statusActive : t.cookies.statusInactive}
                 </span>
               </div>
-              <p className="studio-header-desc">
+              <p className={styles.headerDesc}>
                 {t.cookies.headerDesc}
               </p>
             </div>
           </div>
-          <button className="studio-close-btn" onClick={onClose}>
-            ✕
+          <button className={styles.closeBtn} onClick={onClose} style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <X size={16} />
           </button>
         </div>
 
         {/* Scrollable Content Area */}
-        <div className="cookies-modal-scrollable">
+        <div className={styles.scrollable}>
           {/* Status banner */}
-          <div className="cookies-status-section">
-            {hasCookies ? (
-              <div className="cookie-status-box active">
-                <span className="status-icon">🛡️</span>
-                <div className="status-info">
-                  <strong>{t.cookies.installedTitle}</strong>
+          <div className={styles.statusSection}>
+            {isCookieActive ? (
+              <div className={`${styles.statusBox} ${styles.statusBoxActive}`}>
+                <span className={styles.statusIcon} style={{ display: 'flex', alignItems: 'center' }}>
+                  <ShieldCheck size={18} color="var(--status-success)" />
+                </span>
+                <div className={styles.statusInfo}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+                    <strong>{t.cookies.installedTitle}</strong>
+                    {cookieCount > 0 && (
+                      <span className={styles.cookieBadgeCount}>
+                        {cookieCount} cookies
+                      </span>
+                    )}
+                  </div>
                   <p>
                     {t.cookies.installedDesc(cookieSize)}
                   </p>
                   {sampleLines.length > 0 && (
-                    <details className="cookie-preview-details">
+                    <details className={styles.previewDetails}>
                       <summary>{t.cookies.viewDomains(sampleLines.length)}</summary>
-                      <div className="cookie-preview-code">
+                      <div className={styles.previewCode}>
                         {sampleLines.map((line, idx) => (
                           <div key={idx}>{line}</div>
                         ))}
@@ -187,18 +213,19 @@ export const CookiesModal: React.FC<CookiesModalProps> = ({
                 </div>
                 <button
                   type="button"
-                  className="btn-danger-outline"
+                  className={styles.btnDangerOutline}
                   onClick={() => setShowDeleteConfirm(true)}
                   disabled={isLoading}
-                  style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', whiteSpace: 'nowrap' }}
                 >
                   {t.cookies.clearCookiesBtn}
                 </button>
               </div>
             ) : (
-              <div className="cookie-status-box warning">
-                <span className="status-icon">⚠️</span>
-                <div className="status-info">
+              <div className={`${styles.statusBox} ${styles.statusBoxWarning}`}>
+                <span className={styles.statusIcon} style={{ display: 'flex', alignItems: 'center' }}>
+                  <AlertTriangle size={18} color="var(--status-warning)" />
+                </span>
+                <div className={styles.statusInfo}>
                   <strong>{t.cookies.noCookiesTitle}</strong>
                   <p>
                     {t.cookies.noCookiesDesc}
@@ -209,21 +236,23 @@ export const CookiesModal: React.FC<CookiesModalProps> = ({
           </div>
 
           {/* Separate Storage Security Notice */}
-          <div className="cookies-storage-notice">
-            <span className="cookies-notice-icon">🛡️</span>
+          <div className={styles.storageNotice}>
+            <span className={styles.noticeIcon} style={{ display: 'flex', alignItems: 'center' }}>
+              <Shield size={16} color="var(--primary)" />
+            </span>
             <span>{t.cookies.clearCookiesNotice}</span>
           </div>
 
           {message && (
-            <div className={`cookie-alert-box alert-${message.type}`}>
+            <div className={`${styles.alertBox} ${message.type === 'success' ? styles.alertSuccess : message.type === 'error' ? styles.alertError : styles.alertInfo}`}>
               {message.text}
             </div>
           )}
 
           {/* Input & Upload */}
-          <div className="cookies-body-section">
-            <div className="cookies-upload-row">
-              <label className="cookies-file-label">
+          <div className={styles.bodySection}>
+            <div className={styles.uploadRow}>
+              <label className={styles.fileLabel}>
                 {t.cookies.chooseFile}
                 <input
                   type="file"
@@ -232,11 +261,11 @@ export const CookiesModal: React.FC<CookiesModalProps> = ({
                   style={{ display: 'none' }}
                 />
               </label>
-              <span className="cookies-or-divider">{t.cookies.orPaste}</span>
+              <span className={styles.orDivider}>{t.cookies.orPaste}</span>
             </div>
 
             <textarea
-              className="cookies-textarea"
+              className={styles.textarea}
               rows={7}
               placeholder={`# Netscape HTTP Cookie File (.txt) or JSON format (.json):\n# http://curl.haxx.se/rfc/cookie_spec.html\n.youtube.com\tTRUE\t/\tTRUE\t1750000000\tSID\t...\n\n# Or paste JSON format from Cookie-Editor / EditThisCookie:\n[{"domain": ".youtube.com", "name": "SID", "value": "..."}]`}
               value={cookieText}
@@ -253,7 +282,7 @@ export const CookiesModal: React.FC<CookiesModalProps> = ({
               }}
             />
 
-            <div className="cookies-guide-card">
+            <div className={styles.guideCard}>
               <h4>{t.cookies.guideTitle}</h4>
               <ol>
                 <li>
@@ -277,12 +306,12 @@ export const CookiesModal: React.FC<CookiesModalProps> = ({
         </div>
 
         {/* Footer */}
-        <div className="studio-modal-footer">
-          <button className="studio-btn-cancel" onClick={onClose}>
+        <div className={styles.footer}>
+          <button className={styles.btnCancel} onClick={onClose}>
             {t.cookies.closeBtn}
           </button>
           <button
-            className="studio-btn-render glowing-btn"
+            className={styles.btnSave}
             onClick={handleSave}
             disabled={isLoading || !cookieText.trim()}
           >
@@ -290,21 +319,21 @@ export const CookiesModal: React.FC<CookiesModalProps> = ({
           </button>
         </div>
 
-        {/* Fancy Clear Cookies Confirmation Modal */}
+        {/* Clear Cookies Confirmation Modal */}
         {showDeleteConfirm && (
-          <div className="custom-confirm-modal-overlay" style={{ zIndex: 10005 }}>
-            <div className="custom-confirm-modal-card">
-              <div className="confirm-modal-icon-wrap" style={{ background: 'rgba(239, 68, 68, 0.15)', borderColor: 'rgba(239, 68, 68, 0.4)', color: '#ef4444' }}>
-                🍪
+          <div className={styles.confirmOverlay}>
+            <div className={styles.confirmCard}>
+              <div className={styles.confirmIconWrap} style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <Trash2 size={24} color="#ff1e27" />
               </div>
-              <h3 className="confirm-modal-title">{t.cookies.clearCookiesConfirmTitle}</h3>
-              <p className="confirm-modal-desc">
+              <h3 className={styles.confirmTitle}>{t.cookies.clearCookiesConfirmTitle}</h3>
+              <p className={styles.confirmDesc}>
                 {t.cookies.clearCookiesConfirmDesc}
               </p>
-              <div className="confirm-modal-actions">
+              <div className={styles.confirmActions}>
                 <button
                   type="button"
-                  className="btn-confirm-cancel"
+                  className={styles.confirmKeepBtn}
                   onClick={() => setShowDeleteConfirm(false)}
                   disabled={isLoading}
                 >
@@ -312,7 +341,7 @@ export const CookiesModal: React.FC<CookiesModalProps> = ({
                 </button>
                 <button
                   type="button"
-                  className="btn-confirm-purge"
+                  className={styles.confirmPurgeBtn}
                   onClick={executeDeleteCookies}
                   disabled={isLoading}
                 >

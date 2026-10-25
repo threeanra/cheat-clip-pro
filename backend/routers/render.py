@@ -39,33 +39,62 @@ async def start_batch_render(request: RenderBatchRequest, background_tasks: Back
 
     batch_id = f"batch_{int(time.time())}_{uuid.uuid4().hex[:6]}"
 
+    is_merged = bool(request.settings and getattr(request.settings, "render_mode", "separate") == "merged")
     pfx = (request.settings.title_prefix or "") if request.settings else ""
     sfx = (request.settings.title_suffix or "") if request.settings else ""
 
     clips_status = []
-    for idx, c in enumerate(request.clips):
-        base_t = (c.get("custom_title") or c.get("title_suggestion") or c.get("title") or f"Clip {idx+1}").strip()
-        full_t = f"{pfx}{base_t}{sfx}".strip() if (pfx or sfx) else base_t
+    if is_merged:
+        raw_comp_title = (request.settings.compilation_title or "").strip()
+        if not raw_comp_title:
+            first_clip = request.clips[0]
+            first_base = (first_clip.get("custom_title") or first_clip.get("title_suggestion") or first_clip.get("title") or "Highlight Video").strip()
+            raw_comp_title = f"{first_base} (Merged)"
+        full_comp_title = f"{pfx}{raw_comp_title}{sfx}".strip() if (pfx or sfx) else raw_comp_title
         clips_status.append({
-            "clip_index": idx,
-            "title": full_t,
-            "base_title": base_t,
+            "clip_index": 0,
+            "title": full_comp_title,
+            "base_title": raw_comp_title,
             "status": "pending",
-            "progress_percent": 0
+            "progress_percent": 0,
+            "is_merged": True,
+            "segments_count": len(request.clips)
         })
+        RENDER_BATCHES[batch_id] = {
+            "batch_id": batch_id,
+            "total_clips": 1,
+            "current_clip_index": 0,
+            "overall_status": "running",
+            "clips": clips_status,
+            "zip_url": None,
+            "is_merged": True,
+            "merged_segments_count": len(request.clips)
+        }
+    else:
+        for idx, c in enumerate(request.clips):
+            base_t = (c.get("custom_title") or c.get("title_suggestion") or c.get("title") or f"Clip {idx+1}").strip()
+            full_t = f"{pfx}{base_t}{sfx}".strip() if (pfx or sfx) else base_t
+            clips_status.append({
+                "clip_index": idx,
+                "title": full_t,
+                "base_title": base_t,
+                "status": "pending",
+                "progress_percent": 0
+            })
+        RENDER_BATCHES[batch_id] = {
+            "batch_id": batch_id,
+            "total_clips": len(request.clips),
+            "current_clip_index": 0,
+            "overall_status": "running",
+            "clips": clips_status,
+            "zip_url": None,
+            "is_merged": False
+        }
 
-    RENDER_BATCHES[batch_id] = {
-        "batch_id": batch_id,
-        "total_clips": len(request.clips),
-        "current_clip_index": 0,
-        "overall_status": "running",
-        "clips": clips_status,
-        "zip_url": None
-    }
     BATCH_REQUESTS[batch_id] = request
 
     background_tasks.add_task(process_batch_rendering, batch_id, request)
-    return {"batch_id": batch_id, "total_clips": len(request.clips)}
+    return {"batch_id": batch_id, "total_clips": 1 if is_merged else len(request.clips), "is_merged": is_merged}
 
 
 @router.post("/api/render-batch/{batch_id}/retry")
@@ -87,6 +116,8 @@ async def retry_batch_rendering(
             raise HTTPException(status_code=400, detail="Batch is currently rendering. Please wait for the current clip to finish.")
 
     req = BATCH_REQUESTS[batch_id]
+    if body and body.cookies:
+        req.cookies = body.cookies
     indices_to_retry: List[int] = []
     if body and body.clip_indices:
         indices_to_retry = [i for i in body.clip_indices if 0 <= i < len(batch["clips"])]
@@ -206,10 +237,13 @@ def get_hardware_acceleration_status():
     """Returns detected GPU/CPU hardware acceleration options and recommendations."""
     support = detect_hardware_support()
     rec = support.get("recommended", "cpu")
+    gpu_name = support.get("gpu_name")
+    nvenc_sub = f"{gpu_name} (NVENC)" if (gpu_name and "geforce" in gpu_name.lower() or "rtx" in (gpu_name or "").lower() or "gtx" in (gpu_name or "").lower() or "nvidia" in (gpu_name or "").lower()) else "GeForce & RTX Hardware Acceleration"
     return {
         "status": "success",
         "active_default": ACTIVE_ENCODER_NAME,
         "recommended": rec,
+        "gpu_name": gpu_name,
         "support": support,
         "options": [
             {
@@ -221,7 +255,7 @@ def get_hardware_acceleration_status():
             {
                 "id": "nvenc",
                 "label": "NVIDIA NVENC",
-                "sub": "GeForce & RTX Hardware Acceleration",
+                "sub": nvenc_sub,
                 "available": support.get("nvenc", False),
             },
             {

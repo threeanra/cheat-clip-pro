@@ -1,5 +1,6 @@
 import logging
 import os
+import secrets
 import subprocess
 import sys
 from pathlib import Path
@@ -9,10 +10,13 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 
 from backend.config import _base_dir, logger
 from backend.services.system_service import (
+    auto_cleanup_expired_files,
     cleanup_expired_temp_files,
     clear_temp_files,
     get_current_git_info,
     get_temp_storage_summary,
+    is_server_environment,
+    is_update_allowed,
     run_git_command,
     trigger_detached_restart,
 )
@@ -37,7 +41,7 @@ def verify_admin_access(
     if not provided and authorization and authorization.startswith("Bearer "):
         provided = authorization[7:].strip()
 
-    if provided != admin_key:
+    if not secrets.compare_digest(provided, admin_key):
         raise HTTPException(status_code=401, detail="Unauthorized: Invalid or missing administrator API key")
     return True
 
@@ -55,26 +59,55 @@ async def clear_temp_folder(authorized: bool = Depends(verify_admin_access)):
     from TEMP_DIR and backend/temp. Re-creates empty directories.
     PROTECTED: cookies.txt and any cookie files are strictly PRESERVED and NEVER deleted.
     """
+    if not is_update_allowed():
+        raise HTTPException(
+            status_code=403,
+            detail="Manual server-side cache clearing is disabled in server mode for safety. Background auto-cleanup manages server storage automatically."
+        )
     return clear_temp_files()
 
 
 @router.post("/api/cleanup-expired-temp")
-async def cleanup_expired_temp(max_age_hours: int = 48, authorized: bool = Depends(verify_admin_access)):
+async def cleanup_expired_temp(max_age_hours: int = 1, authorized: bool = Depends(verify_admin_access)):
     """Deletes temporary frame images and slices older than max_age_hours."""
     return cleanup_expired_temp_files(max_age_hours=max_age_hours)
 
 
+@router.post("/api/auto-cleanup")
+async def api_trigger_auto_cleanup(
+    max_age_seconds: int = 3600,
+    max_storage_gb: float = 5.0,
+    authorized: bool = Depends(verify_admin_access)
+):
+    """Manually triggers dual-mode auto-cleanup (Option 1: TTL + Option 2: Quota)."""
+    return auto_cleanup_expired_files(
+        max_age_seconds=max_age_seconds,
+        max_storage_bytes=int(max_storage_gb * 1024 * 1024 * 1024)
+    )
+
+
 @router.get("/api/system/version")
 def api_system_version():
-    """Returns local git version information."""
+    """Returns local git version and environment update permission information."""
     return get_current_git_info()
 
 
 @router.get("/api/system/check-update")
 def api_check_update():
-    """Fetches origin and checks if updates are available."""
-    root_dir = Path(_base_dir).parent
+    """Fetches origin and checks if updates are available. Disabled in server environments for security."""
     info = get_current_git_info()
+    if not is_update_allowed():
+        return {
+            **info,
+            "update_available": False,
+            "behind_count": 0,
+            "changelog": [],
+            "is_server": True,
+            "allow_update": False,
+            "message": "Self-update is disabled in server / Docker environment for security. Please update through your orchestrator (e.g. Dokploy / Git)."
+        }
+
+    root_dir = Path(_base_dir).parent
     branch = info.get("branch", "master") or "master"
 
     # Fetch origin
@@ -116,6 +149,12 @@ def api_check_update():
 @router.post("/api/system/update")
 async def api_perform_update(authorized: bool = Depends(verify_admin_access)):
     """Pulls latest code, syncs dependencies if modified, and triggers background restart."""
+    if not is_update_allowed():
+        raise HTTPException(
+            status_code=403,
+            detail="System self-update via Web UI is disabled in server / Docker environment for security. Please update through your server orchestrator (e.g. Dokploy / Git pull)."
+        )
+
     root_dir = Path(_base_dir).parent
     info = get_current_git_info()
     branch = info.get("branch", "master") or "master"
@@ -194,7 +233,12 @@ async def api_perform_update(authorized: bool = Depends(verify_admin_access)):
 
 @router.post("/api/system/restart")
 async def api_restart_app(authorized: bool = Depends(verify_admin_access)):
-    """Triggers an immediate background restart without pulling code."""
+    """Triggers an immediate background restart without pulling code. Disabled in server environments for security."""
+    if not is_update_allowed():
+        raise HTTPException(
+            status_code=403,
+            detail="Server restarts via Web UI are disabled in server / Docker environment for security."
+        )
     trigger_detached_restart(delay=2.5)
     return {
         "success": True,

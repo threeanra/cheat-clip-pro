@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { ArrowLeft, ArrowRight } from 'lucide-react';
 import { useLanguage } from '../locales';
 import type {
   ViralClip,
@@ -127,7 +128,7 @@ export const ClipStudioModal: React.FC<ClipStudioModalProps> = ({
         {/* Header */}
         <div className="studio-modal-header">
           <div className="studio-header-title">
-            <div className="studio-icon-badge">🎬</div>
+            <div className="studio-icon-badge">&gt;_</div>
             <div>
               <div className="studio-title-row">
                 <h2>{t.studio.heading}</h2>
@@ -250,19 +251,20 @@ export const ClipStudioModal: React.FC<ClipStudioModalProps> = ({
                       </div>
                       <div className="pill-group framing-pills" style={{ display: 'flex', flexWrap: 'wrap', gap: '0.4rem' }}>
                         {[
-                          { id: 'auto', label: t.studio.framingAuto || '🤖 AI Auto' },
-                          { id: 'center', label: t.studio.framingCenter || '🎯 Center (50%)' },
-                          { id: 'left', label: t.studio.framingLeft || '⬅️ Left Focus (35%)' },
-                          { id: 'right', label: t.studio.framingRight || '➡️ Right Focus (65%)' },
+                          { id: 'auto', label: t.studio.framingAuto || 'AI Auto (Face & Object)' },
+                          { id: 'center', label: t.studio.framingCenter || 'Center (50%)' },
+                          { id: 'left', icon: <ArrowLeft size={13} />, label: t.studio.framingLeft || 'Left Focus (35%)' },
+                          { id: 'right', icon: <ArrowRight size={13} />, label: t.studio.framingRight || 'Right Focus (65%)' },
                         ].map(opt => (
                           <button
                             key={opt.id}
                             type="button"
                             className={`pill-btn ${facecamPosition === opt.id ? 'active' : ''}`}
-                            style={{ fontSize: '0.75rem', padding: '0.3rem 0.65rem' }}
+                            style={{ fontSize: '0.75rem', padding: '0.35rem 0.65rem', display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}
                             onClick={() => setFacecamPosition(opt.id as FacecamPosition)}
                           >
-                            {opt.label}
+                            {opt.icon}
+                            <span>{opt.label.replace(/^[⬅️←<\->\s]+/, '')}</span>
                           </button>
                         ))}
                       </div>
@@ -399,7 +401,7 @@ export const ClipStudioModal: React.FC<ClipStudioModalProps> = ({
                   {t.studio.strictlyOneLine}
                 </span>
               </label>
-              <div className="caption-styles-grid">
+              <div className="caption-styles-grid" style={{ fontFamily: captionFont }}>
                 <button
                   type="button"
                   className={`caption-style-card viral-pop ${captionStyle === 'viral_pop' ? 'active' : ''}`}
@@ -509,7 +511,7 @@ export const ClipStudioModal: React.FC<ClipStudioModalProps> = ({
                           type="button"
                           className={`pill-btn ${captionFont === font ? 'active' : ''}`}
                           onClick={() => setCaptionFont(font)}
-                          style={{ fontFamily: font, fontSize: '0.78rem' }}
+                          style={{ fontFamily: font, fontSize: '0.78rem', fontWeight: captionFont === font ? 700 : 400 }}
                         >
                           {font}
                         </button>
@@ -622,7 +624,7 @@ export const ClipStudioModal: React.FC<ClipStudioModalProps> = ({
                           {clip.title_suggestion || clip.title}
                         </span>
                         <span className="batch-clip-ts">
-                          ⏱️ {Math.floor(clip.start_time / 60)}:{(clip.start_time % 60).toFixed(0).padStart(2, '0')} -{' '}
+                           {Math.floor(clip.start_time / 60)}:{(clip.start_time % 60).toFixed(0).padStart(2, '0')} -{' '}
                           {Math.floor(clip.end_time / 60)}:{(clip.end_time % 60).toFixed(0).padStart(2, '0')} (
                           {(clip.end_time - clip.start_time).toFixed(0)}s)
                         </span>
@@ -688,12 +690,12 @@ export const ClipStudioModal: React.FC<ClipStudioModalProps> = ({
                             </svg>
                             <span className="pip-skeleton-text">CAM</span>
                           </div>
-                          <div className="wireframe-pip-badge">🔴 CAM</div>
+                          <div className="wireframe-pip-badge">[*] CAM</div>
                         </div>
                       )}
                       {streamerPreset === 'split_top_cam' && (
                         <div className="wireframe-gameplay-badge">
-                          🎮 GAMEPLAY ({aspectRatio})
+                          // GAMEPLAY ({aspectRatio})
                         </div>
                       )}
                     </div>
@@ -750,7 +752,7 @@ export const ClipStudioModal: React.FC<ClipStudioModalProps> = ({
                     <span
                       className="wireframe-caption-text"
                       style={{
-                        fontFamily: captionFont,
+                        fontFamily: `'${captionFont}', sans-serif`,
                         fontSize: fontSize === 'small' ? '0.72rem' : fontSize === 'big' ? '0.96rem' : '0.82rem',
                       }}
                     >

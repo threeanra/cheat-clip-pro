@@ -9,8 +9,12 @@ import subprocess
 import unicodedata
 import math
 import urllib.parse
+import urllib.request
+import contextlib
+import tempfile
+import threading
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple, Union
+from typing import List, Dict, Any, Optional, Tuple, Union, Callable
 from PIL import Image, ImageDraw, ImageFont
 
 logger = logging.getLogger("cheat-clip-pro.video-engine")
@@ -22,8 +26,164 @@ FONTS_DIR = BASE_DIR / "fonts"
 COOKIES_PATH = BASE_DIR / "cookies.txt"
 ROOT_COOKIES_PATH = BASE_DIR.parent / "cookies.txt"
 
+
+def normalize_to_netscape(raw_content: str) -> str:
+    """Cleans raw cookie input, strips UTF BOMs and null bytes, and auto-converts
+    JSON cookies, HTTP Cookie headers, or misaligned columns to valid Netscape format for yt-dlp.
+    """
+    if not raw_content:
+        return ""
+
+    text = (
+        raw_content.replace("\ufeff", "")
+        .replace("\ufffe", "")
+        .replace("\x00", "")
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+        .strip()
+    )
+
+    if not text:
+        return ""
+
+    # 1. Check for JSON format (Cookie-Editor, EditThisCookie, etc.)
+    if text.startswith("[") or text.startswith("{"):
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict) and "cookies" in parsed and isinstance(parsed["cookies"], list):
+                parsed = parsed["cookies"]
+            elif isinstance(parsed, dict):
+                parsed = [parsed]
+            if isinstance(parsed, list) and len(parsed) > 0 and isinstance(parsed[0], dict):
+                lines = [
+                    "# Netscape HTTP Cookie File",
+                    "# http://curl.haxx.se/rfc/cookie_spec.html",
+                    "# Converted automatically from JSON format by CheatClip Pro",
+                    "",
+                ]
+                count = 0
+                for item in parsed:
+                    domain = str(item.get("domain") or item.get("host") or "").strip()
+                    if not domain:
+                        domain = ".youtube.com"
+                    flag = "TRUE" if domain.startswith(".") else "FALSE"
+                    path = str(item.get("path") or "/").strip()
+                    secure = "TRUE" if item.get("secure") else "FALSE"
+                    exp = item.get("expirationDate") or item.get("expires") or item.get("expiry") or 0
+                    try:
+                        exp_int = int(float(exp))
+                    except Exception:
+                        exp_int = 0
+                    if exp_int <= 0:
+                        exp_int = 2147483647
+
+                    name = str(item.get("name") or "").strip()
+                    val = str(item.get("value") or "").strip()
+                    if name:
+                        lines.append(f"{domain}\t{flag}\t{path}\t{secure}\t{exp_int}\t{name}\t{val}")
+                        count += 1
+
+                if count > 0:
+                    return "\n".join(lines) + "\n"
+        except Exception:
+            pass
+
+    # 2. Check for HTTP Cookie header format (e.g. from browser DevTools Network tab or curl: "Cookie: SID=...; HSID=...")
+    clean_header = text
+    if clean_header.lower().startswith("cookie:"):
+        clean_header = clean_header[7:].strip()
+    if ";" in clean_header and "=" in clean_header and "\t" not in clean_header:
+        pairs = clean_header.split(";")
+        header_lines = [
+            "# Netscape HTTP Cookie File",
+            "# http://curl.haxx.se/rfc/cookie_spec.html",
+            "# Converted automatically from HTTP Cookie header by CheatClip Pro",
+            "",
+        ]
+        cookie_count = 0
+        for pair in pairs:
+            pair = pair.strip()
+            if not pair or "=" not in pair:
+                continue
+            k, v = pair.split("=", 1)
+            name = k.strip()
+            val = v.strip()
+            if name:
+                header_lines.append(f".youtube.com\tTRUE\t/\tTRUE\t2147483647\t{name}\t{val}")
+                cookie_count += 1
+        if cookie_count > 0:
+            return "\n".join(header_lines) + "\n"
+
+    # 3. Handle standard Netscape text and space-to-tab repair
+    lines = text.split("\n")
+    cleaned_lines = []
+    has_header = False
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if "# Netscape HTTP Cookie File" in stripped:
+            has_header = True
+            cleaned_lines.append(stripped)
+            continue
+        if stripped.startswith("#") and not stripped.startswith("#HttpOnly_"):
+            cleaned_lines.append(stripped)
+            continue
+
+        # If line has spaces instead of tabs, convert 2+ spaces to tabs
+        if "\t" not in stripped:
+            parts = re.split(r'\s{2,}|\t', stripped)
+            if len(parts) >= 6:
+                stripped = "\t".join(parts)
+
+        cleaned_lines.append(stripped)
+
+    if not has_header:
+        cleaned_lines.insert(0, "# Netscape HTTP Cookie File")
+        cleaned_lines.insert(1, "# http://curl.haxx.se/rfc/cookie_spec.html")
+        cleaned_lines.insert(2, "")
+
+    return "\n".join(cleaned_lines) + "\n"
+
+
+@contextlib.contextmanager
+def ephemeral_cookies_file(cookies_content: Optional[str]):
+    """Creates a temporary Netscape cookies file for a single task and ensures it is deleted immediately."""
+    if not cookies_content or len(str(cookies_content).strip()) < 10:
+        yield None
+        return
+
+    normalized = normalize_to_netscape(str(cookies_content))
+    if not normalized or len(normalized.strip()) < 10:
+        yield None
+        return
+
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    temp_file = tempfile.NamedTemporaryFile(
+        mode="w",
+        prefix="yt_cookie_",
+        suffix=".txt",
+        dir=str(TEMP_DIR),
+        delete=False,
+        encoding="utf-8"
+    )
+    temp_path = Path(temp_file.name)
+    try:
+        temp_file.write(normalized)
+        temp_file.flush()
+        temp_file.close()
+        yield temp_path
+    finally:
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except Exception:
+            pass
+
+
 def get_effective_cookies_path() -> Optional[Path]:
-    """Returns valid cookies file path from backend/cookies.txt or root cookies.txt."""
+    """Returns valid cookies file path if persistent file exists on disk (fallback)."""
     if COOKIES_PATH.exists() and COOKIES_PATH.stat().st_size > 0:
         return COOKIES_PATH
     if ROOT_COOKIES_PATH.exists() and ROOT_COOKIES_PATH.stat().st_size > 0:
@@ -123,21 +283,44 @@ def ensure_ffmpeg_in_path():
 
 ensure_ffmpeg_in_path()
 
-# Global lazy-loaded whisper model
+# Global lazy-loaded whisper model and thread lock for PyTorch attention safety
 _WHISPER_MODEL = None
+_WHISPER_LOCK = threading.Lock()
 
 
 def get_whisper_model():
     global _WHISPER_MODEL
-    if _WHISPER_MODEL is None:
-        try:
-            import whisper
-            logger.info("Loading Whisper 'base' model for word-level timestamps...")
-            _WHISPER_MODEL = whisper.load_model("base")
-        except Exception as e:
-            logger.warning(f"Could not load Whisper model: {e}")
-            _WHISPER_MODEL = False
+    with _WHISPER_LOCK:
+        if _WHISPER_MODEL is None:
+            try:
+                import whisper
+                # Prefer 'small' model (better vocabulary & multi-lingual accuracy, esp. Indonesian speech)
+                # Falls back to 'base' if 'small' cannot be loaded
+                try:
+                    logger.info("Loading Whisper 'small' model for high-accuracy word-level timestamps...")
+                    _WHISPER_MODEL = whisper.load_model("small")
+                except Exception as e_small:
+                    logger.warning(f"Could not load Whisper 'small' model ({e_small}). Falling back to 'base'...")
+                    _WHISPER_MODEL = whisper.load_model("base")
+            except Exception as e:
+                logger.warning(f"Could not load Whisper model: {e}")
+                _WHISPER_MODEL = False
     return _WHISPER_MODEL if _WHISPER_MODEL is not False else None
+
+
+def release_whisper_model():
+    """Explicitly frees Whisper PyTorch model from RAM to preserve memory on low-spec servers."""
+    global _WHISPER_MODEL
+    with _WHISPER_LOCK:
+        if _WHISPER_MODEL is not None and _WHISPER_MODEL is not False:
+            try:
+                del _WHISPER_MODEL
+                _WHISPER_MODEL = None
+                import gc
+                gc.collect()
+                logger.info("Whisper model unloaded from memory to free server RAM.")
+            except Exception:
+                pass
 
 
 def check_encoder_support(encoder_name: str) -> bool:
@@ -157,11 +340,48 @@ def check_encoder_support(encoder_name: str) -> bool:
 ENCODER_CONFIGS: Dict[str, Tuple[str, List[str]]] = {
     "nvenc": ("h264_nvenc", ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "23"]),
     "amf": ("h264_amf", ["-c:v", "h264_amf", "-quality", "speed", "-rc", "cbr", "-b:v", "6M"]),
-    "qsv": ("h264_qsv", ["-c:v", "h264_qsv", "-preset", "veryfast"]),
-    "cpu": ("libx264", ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22"]),
+    "qsv": ("h264_qsv", ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", "23", "-look_ahead", "0"]),
+    "cpu": ("libx264", ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-threads", "2"]),
 }
 
 _DETECTED_SUPPORT: Optional[Dict[str, Any]] = None
+
+
+def get_system_gpu_name() -> Optional[str]:
+    """Detects the physical GPU model name on the host system."""
+    # Try nvidia-smi query first
+    if shutil.which("nvidia-smi"):
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                universal_newlines=True,
+                timeout=3,
+                stderr=subprocess.DEVNULL
+            ).strip()
+            if out:
+                return out.split("\n")[0].strip()
+        except Exception:
+            pass
+
+    # On Windows, query CIM VideoController
+    if sys.platform.startswith("win"):
+        try:
+            out = subprocess.check_output(
+                ["powershell", "-NoProfile", "-Command", "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name"],
+                universal_newlines=True,
+                timeout=4,
+                stderr=subprocess.DEVNULL
+            ).strip()
+            lines = [l.strip() for l in out.split("\n") if l.strip()]
+            for l in lines:
+                if any(k in l.lower() for k in ["nvidia", "geforce", "rtx", "gtx", "radeon", "intel arc", "arc"]):
+                    return l
+            if lines:
+                return lines[0]
+        except Exception:
+            pass
+
+    return None
 
 
 def detect_hardware_support() -> Dict[str, Any]:
@@ -183,12 +403,15 @@ def detect_hardware_support() -> Dict[str, Any]:
     else:
         recommended = "cpu"
 
+    gpu_name = get_system_gpu_name()
+
     _DETECTED_SUPPORT = {
         "nvenc": has_nvenc,
         "amf": has_amf,
         "qsv": has_qsv,
         "cpu": True,
         "recommended": recommended,
+        "gpu_name": gpu_name,
     }
     return _DETECTED_SUPPORT
 
@@ -254,7 +477,10 @@ def get_yt_dlp_cookies_args() -> List[str]:
     return []
 
 
-def get_yt_dlp_base_cmd(include_cookies: bool = True) -> List[str]:
+def get_yt_dlp_base_cmd(
+    include_cookies: bool = True,
+    cookies_path: Optional[Union[str, Path]] = None,
+) -> List[str]:
     """
     Returns base command for yt-dlp with JavaScript runtime, player extractor args, and cookies.
     Tries standalone 'yt-dlp' executable first, then falls back to python module:
@@ -278,18 +504,18 @@ def get_yt_dlp_base_cmd(include_cookies: bool = True) -> List[str]:
     elif shutil.which("node"):
         cmd.extend(["--js-runtimes", "node"])
 
-    # Prevent 'The page needs to be reloaded. Please try again later.'
-    # by allowing yt-dlp to fall back from default/tv_downgraded to web_embedded and ios client APIs.
-    cmd.extend([
-        "--extractor-args", "youtube:player_client=default,web_embedded,ios",
-        "--force-ipv4"
-    ])
-
-    if include_cookies:
+    if cookies_path and Path(cookies_path).exists() and Path(cookies_path).stat().st_size > 0:
+        has_active_cookies = True
+        logger.info(f"Using ephemeral YouTube cookies from: {cookies_path}")
+        cmd.extend(["--cookies", str(cookies_path)])
+    elif include_cookies:
         eff = get_effective_cookies_path()
-        if eff:
+        if eff and eff.exists() and eff.stat().st_size > 0:
+            has_active_cookies = True
             logger.info(f"Using YouTube cookies from: {eff}")
             cmd.extend(["--cookies", str(eff)])
+
+    cmd.append("--force-ipv4")
     return cmd
 
 
@@ -494,49 +720,14 @@ def compute_audio_energy_heatmap(file_path: Union[str, Path], duration: float, n
     return heatmap
 
 
-def _extract_audio_for_transcription(file_path: Union[str, Path]) -> Path:
-    """Convert a media file to a Whisper-compatible mono WAV track."""
-    audio_path = TEMP_DIR / f"whisper_audio_{time.time_ns()}.wav"
-    cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-i", str(file_path),
-        "-map", "0:a:0?",
-        "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
-        str(audio_path),
-    ]
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-    except FileNotFoundError as exc:
-        raise RuntimeError(
-            "FFmpeg is required to extract the video's audio track for transcription."
-        ) from exc
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("Audio extraction timed out before transcription could start.") from exc
-
-    if result.returncode != 0 or not audio_path.exists() or audio_path.stat().st_size <= 44:
-        try:
-            audio_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-
-        stderr = (result.stderr or "").lower()
-        if "does not contain any stream" in stderr or "matches no streams" in stderr:
-            raise RuntimeError(
-                "This video does not contain a readable audio track. "
-                "Upload a video with audio or provide a transcript/subtitle file."
-            )
-        raise RuntimeError(
-            "The video's audio track could not be decoded for transcription. "
-            "Please re-encode the video or provide a transcript/subtitle file."
-        )
-
-    return audio_path
-
-
-def transcribe_local_video_file(file_path: Union[str, Path], progress_callback=None) -> List[Dict[str, Any]]:
+def transcribe_local_video_file(
+    file_path: Union[str, Path],
+    progress_callback=None,
+    target_language: Optional[str] = None
+) -> List[Dict[str, Any]]:
     """
     Transcribes speech from a local video or audio file using OpenAI Whisper.
+    Strictly focuses on Bahasa Indonesia or English.
     Returns standard transcript segments formatted as:
     [{"text": "...", "start": 0.0, "duration": 3.5}, ...]
     """
@@ -554,55 +745,71 @@ def transcribe_local_video_file(file_path: Union[str, Path], progress_callback=N
     if progress_callback:
         progress_callback("Running Whisper AI", f"Extracting dialogue from {p.name} with Whisper...", 30)
 
-    audio_path = None
-    try:
-        audio_path = _extract_audio_for_transcription(p)
-        logger.info(f"Transcribing local file with Whisper: {p} (audio: {audio_path.name})")
-        result = whisper_model.transcribe(
-            str(audio_path),
-            word_timestamps=True,
-            fp16=False,
-            verbose=False,
-            condition_on_previous_text=False,
-        )
+    logger.info(f"Transcribing local file with Whisper: {p} (target_language={target_language})")
+    whisper_prompt = (
+        "Transkrip video percakapan dalam Bahasa Indonesia." if target_language == "id"
+        else "Video dialogue transcript in English." if target_language == "en"
+        else "Transkrip video percakapan dalam Bahasa Indonesia atau English."
+    )
+    transcribe_kwargs: Dict[str, Any] = {
+        "word_timestamps": False,  # Dialogue segment detection does not need word timestamps; avoids find_alignment DTW tensor shape mismatch
+        "fp16": False,
+        "verbose": False,
+        "condition_on_previous_text": False,
+        "initial_prompt": whisper_prompt,
+    }
+    if target_language in ("id", "en"):
+        transcribe_kwargs["language"] = target_language
 
-        segments = result.get("segments", [])
-        transcript_lines = []
+    result = None
+    with _WHISPER_LOCK:
+        try:
+            result = whisper_model.transcribe(str(p), **transcribe_kwargs)
+        except RuntimeError as e:
+            err_str = str(e).lower()
+            if "dimension" in err_str or "tensor" in err_str or "size" in err_str:
+                logger.warning(f"Whisper attention tensor mismatch ({e}), retrying without prompt/condition...")
+                minimal_kwargs: Dict[str, Any] = {
+                    "word_timestamps": False,
+                    "fp16": False,
+                    "verbose": False,
+                    "condition_on_previous_text": False,
+                }
+                if target_language in ("id", "en"):
+                    minimal_kwargs["language"] = target_language
+                result = whisper_model.transcribe(str(p), **minimal_kwargs)
+            else:
+                raise
 
-        for seg in segments:
-            text = seg.get("text", "").strip()
-            if not text:
-                text = " ".join(
-                    word.get("word", "").strip()
-                    for word in seg.get("words", [])
-                    if word.get("word", "").strip()
-                ).strip()
-            if not text:
-                continue
-            start = round(float(seg.get("start", 0.0)), 2)
-            end = round(float(seg.get("end", start + 2.0)), 2)
-            dur = round(max(0.4, end - start), 2)
-            transcript_lines.append({
-                "text": text,
-                "start": start,
-                "duration": dur
-            })
+    if not result:
+        return []
 
-        logger.info(f"Whisper transcribed {len(transcript_lines)} dialogue segments from {p.name}")
-        return transcript_lines
-    finally:
-        if audio_path is not None:
-            try:
-                audio_path.unlink(missing_ok=True)
-            except OSError:
-                logger.warning(f"Could not remove temporary transcription audio: {audio_path}")
+    segments = result.get("segments", [])
+    transcript_lines = []
+
+    for seg in segments:
+        text = seg.get("text", "").strip()
+        if not text:
+            continue
+        start = round(float(seg.get("start", 0.0)), 2)
+        end = round(float(seg.get("end", start + 2.0)), 2)
+        dur = round(max(0.4, end - start), 2)
+        transcript_lines.append({
+            "text": text,
+            "start": start,
+            "duration": dur
+        })
+
+    logger.info(f"Whisper transcribed {len(transcript_lines)} dialogue segments from {p.name}")
+    return transcript_lines
 
 
 def download_clip_segment(
     video_url: str,
     start_time: float,
     end_time: float,
-    output_filename: str
+    output_filename: str,
+    cookies_content: Optional[str] = None
 ) -> str:
     """
     Downloads or slices the requested time slice in high definition (1080p).
@@ -662,8 +869,27 @@ def download_clip_segment(
                         local_source = f
                         break
 
+    clip_duration = max(1.0, end_time - start_time)
+
+    if local_source and local_source.exists():
+        # If user provided cookies and this local_source was a low-res guest-mode file (< 720p), skip it to download genuine 1080p
+        is_direct_upload = "upload_" in clean_raw.lower() or "gdrive_" in clean_raw.lower()
+        if not is_direct_upload and (cookies_content or get_effective_cookies_path()):
+            try:
+                probe = subprocess.run(
+                    ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=height", "-of", "csv=p=0", str(local_source)],
+                    capture_output=True, text=True, timeout=5
+                )
+                h = int(probe.stdout.strip()) if probe.stdout.strip().isdigit() else 0
+                if h > 0 and h < 720:
+                    logger.info(f"Local source {local_source.name} is low resolution ({h}p < 720p) and cookies are active. Skipping cache to download genuine 1080p.")
+                    local_source = None
+            except Exception:
+                pass
+
     if local_source and local_source.exists():
         logger.info(f"Slicing local/gdrive video: {local_source} [{start_time:.2f}s -> {end_time:.2f}s] to {output_path}")
+        slice_timeout = max(300, min(1200, int(clip_duration * 6) + 90))
         slice_cmd = [
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
             "-ss", str(start_time),
@@ -675,7 +901,7 @@ def download_clip_segment(
             "-movflags", "+faststart",
             str(output_path)
         ]
-        res = subprocess.run(slice_cmd, capture_output=True, text=True, timeout=90)
+        res = subprocess.run(slice_cmd, capture_output=True, text=True, timeout=slice_timeout)
         if output_path.exists() and is_valid_mp4(output_path):
             return str(output_path)
         if output_path.exists():
@@ -686,227 +912,233 @@ def download_clip_segment(
         raise RuntimeError(f"Failed to slice video clip from source '{local_source.name}': {res.stderr or 'Corrupted video stream'}")
 
     # Guard: if it was a Google Drive or Upload request, never send to YouTube
-    if "gdrive" in clean_raw.lower() or "upload_" in clean_raw.lower() or clean_raw.startswith("/api/video/"):
+    # Exception: if it was a YouTube audio cache file (e.g. /api/video/yt_audio_iLijjSEI_40.mp4), resolve back to original YouTube video
+    yt_audio_match = re.search(r'yt_audio_([a-zA-Z0-9_-]{11})', clean_raw)
+    if yt_audio_match:
+        yt_id = yt_audio_match.group(1)
+        clean_url = f"https://www.youtube.com/watch?v={yt_id}"
+        logger.info(f"Resolved cached audio reference '{clean_raw}' back to genuine YouTube stream: {clean_url}")
+    elif "gdrive" in clean_raw.lower() or "upload_" in clean_raw.lower() or clean_raw.startswith("/api/video/"):
         raise RuntimeError(f"Source video file not found on disk for '{clean_raw}'. Please re-analyze the video.")
+    else:
+        # Sanitize video URL for YouTube download
+        clean_url = video_url.strip()
+        if not clean_url.startswith("http"):
+            clean_url = f"https://www.youtube.com/watch?v={clean_url}"
 
-    # Sanitize video URL for YouTube download
-    clean_url = video_url.strip()
-    if not clean_url.startswith("http"):
-        clean_url = f"https://www.youtube.com/watch?v={clean_url}"
-
-    clip_duration = max(1.0, end_time - start_time)
     t_start_fmt = format_section_time(start_time)
     t_end_fmt = format_section_time(end_time)
 
-    # Dynamic timeout: Minimum 60s, plus 3s per second of clip duration (max 180s).
-    # Allows fast fallback instead of stalling for 5+ minutes when user internet lags.
-    timeout_sec = min(180, max(60, int(clip_duration * 3) + 40))
+    # Dynamic timeout: Base 300s, plus 5s per second of clip duration (max 1200s / 20 min).
+    # Ensures clips > 1 minute (e.g. 70s, 90s, 120s, 180s) have ample time to download and merge without timing out.
+    timeout_sec = max(300, min(1200, int(clip_duration * 5) + 90))
 
-    has_cookies = get_effective_cookies_path() is not None
-    # If cookies are present, try with cookies first; if rejected by YouTube (or any reload/bot error), try guest mode.
-    attempts = [True, False] if has_cookies else [False]
-    last_err_snippet = "unknown"
+    with ephemeral_cookies_file(cookies_content) as temp_cookies:
+        has_cookies = temp_cookies is not None or get_effective_cookies_path() is not None
+        # If cookies are present, try with cookies first; if rejected by YouTube (or any reload/bot error), try guest mode.
+        attempts = [True, False] if has_cookies else [False]
+        last_err_snippet = "unknown"
 
-    for use_cookies in attempts:
-        mode_label = "with cookies" if use_cookies else "guest mode (without cookies)"
-        base_cmd = get_yt_dlp_base_cmd(include_cookies=use_cookies)
-        logger.info(f"Downloading HD section ({clip_duration:.1f}s) {t_start_fmt} -> {t_end_fmt} for {clean_url} ({mode_label}, timeout: {timeout_sec}s)")
+        for use_cookies in attempts:
+            mode_label = "with cookies" if use_cookies else "guest mode (without cookies)"
+            base_cmd = get_yt_dlp_base_cmd(include_cookies=use_cookies, cookies_path=temp_cookies if use_cookies else None)
+            logger.info(f"Downloading HD section ({clip_duration:.1f}s) {t_start_fmt} -> {t_end_fmt} for {clean_url} ({mode_label}, timeout: {timeout_sec}s)")
 
-        # Method 1: yt-dlp --download-sections with multi-fragment acceleration, socket timeout, & retries
-        cmd = [
-            *base_cmd,
-            "--download-sections", f"*{t_start_fmt}-{t_end_fmt}",
-            "--force-keyframes-at-cuts",
-            "-f", "bestvideo[height<=1080]+bestaudio/best[height<=1080]/bestvideo+bestaudio/best",
-            "-N", "4",
-            "--socket-timeout", "20",
-            "--fragment-retries", "5",
-            "--retries", "5",
-            "--file-access-retries", "3",
-            "-o", str(output_path),
-            "--merge-output-format", "mp4",
-            "--no-warnings",
-            clean_url
-        ]
-        try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
-            if res.returncode == 0 and is_valid_mp4(output_path):
-                logger.info(f"Successfully downloaded section ({mode_label}): {output_path} ({output_path.stat().st_size} bytes)")
-                return str(output_path)
-            # If not valid or returncode != 0, clean up any incomplete/corrupt partial file immediately
-            if output_path.exists():
-                try:
-                    output_path.unlink()
-                except Exception:
-                    pass
-            last_err_snippet = res.stderr[:300] if (res and res.stderr) else "empty output or invalid file (moov atom missing)"
-        except subprocess.TimeoutExpired:
-            logger.warning(f"yt-dlp download-sections timed out after {timeout_sec}s for {clean_url} ({mode_label}).")
-            if output_path.exists():
-                try:
-                    output_path.unlink()
-                except Exception:
-                    pass
-            last_err_snippet = f"download-sections timed out after {timeout_sec}s due to network lag"
-        except Exception as e:
-            logger.warning(f"yt-dlp download-sections failed ({e}) ({mode_label}).")
-            if output_path.exists():
-                try:
-                    output_path.unlink()
-                except Exception:
-                    pass
-            last_err_snippet = str(e)
-
-        # Method 2: Fallback - Extract direct stream URLs with yt-dlp and slice using FFmpeg with network reconnect
-        logger.info(f"Direct section download fallback ({last_err_snippet}), trying stream URL trimming with auto-reconnect ({mode_label})...")
-        try:
-            if output_path.exists():
-                try:
-                    output_path.unlink()
-                except Exception:
-                    pass
-            url_cmd = [
-                *base_cmd,
-                "--socket-timeout", "20",
-                "-g",
-                "-f", "bestvideo[height<=1080]+bestaudio/best[height<=1080]/bestvideo+bestaudio/best",
-                clean_url
-            ]
-            url_res = subprocess.run(url_cmd, capture_output=True, text=True, timeout=30)
-            if url_res.returncode == 0 and url_res.stdout.strip():
-                urls = url_res.stdout.strip().split("\n")
-                video_stream = urls[0]
-                audio_stream = urls[1] if len(urls) > 1 else urls[0]
-
-                trim_timeout = min(150, max(60, int(clip_duration * 2.5) + 30))
-                trim_cmd = [
-                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                    "-reconnect", "1",
-                    "-reconnect_at_eof", "1",
-                    "-reconnect_streamed", "1",
-                    "-reconnect_delay_max", "5",
-                    "-ss", str(start_time),
-                    "-i", video_stream,
-                    "-ss", str(start_time),
-                    "-i", audio_stream,
-                    "-t", str(clip_duration),
-                    "-map", "0:v:0", "-map", "1:a:0?",
-                    *ACTIVE_ENCODER_ARGS,
-                    "-c:a", "aac",
-                    "-b:a", "192k",
-                    "-avoid_negative_ts", "make_zero",
-                    "-movflags", "+faststart",
-                    str(output_path)
-                ]
-                trim_res = subprocess.run(trim_cmd, capture_output=True, text=True, timeout=trim_timeout)
-                if trim_res.returncode == 0 and is_valid_mp4(output_path):
-                    logger.info(f"Successfully trimmed stream URLs with FFmpeg ({mode_label}): {output_path} ({output_path.stat().st_size} bytes)")
-                    return str(output_path)
-                else:
-                    if output_path.exists():
-                        try:
-                            output_path.unlink()
-                        except Exception:
-                            pass
-                    last_err_snippet = trim_res.stderr[:300] if (trim_res and trim_res.stderr) else "stream trimming failed"
-        except Exception as e:
-            logger.error(f"Fallback stream trimming failed ({mode_label}): {e}")
-            if output_path.exists():
-                try:
-                    output_path.unlink()
-                except Exception:
-                    pass
-            last_err_snippet = str(e)
-
-        # Method 3: Fallback - Download at 720p (vastly lower bandwidth, skips SABR/1080p throttling)
-        logger.info(f"Method 3: Attempting fast 720p fallback section download for {clean_url} ({mode_label})...")
-        try:
-            if output_path.exists():
-                try:
-                    output_path.unlink()
-                except Exception:
-                    pass
-            cmd_720p = [
+            # Method 1: yt-dlp --download-sections with multi-fragment acceleration, socket timeout, & retries
+            cmd = [
                 *base_cmd,
                 "--download-sections", f"*{t_start_fmt}-{t_end_fmt}",
                 "--force-keyframes-at-cuts",
-                "-f", "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+                "-f", "bestvideo[height<=1080]+bestaudio/best[height<=1080]/bestvideo+bestaudio/best",
                 "-N", "4",
                 "--socket-timeout", "20",
                 "--fragment-retries", "5",
                 "--retries", "5",
+                "--file-access-retries", "3",
                 "-o", str(output_path),
                 "--merge-output-format", "mp4",
                 "--no-warnings",
                 clean_url
             ]
-            timeout_720p = min(120, max(50, int(clip_duration * 2) + 30))
-            res_720p = subprocess.run(cmd_720p, capture_output=True, text=True, timeout=timeout_720p)
-            if res_720p.returncode == 0 and is_valid_mp4(output_path):
-                logger.info(f"Successfully downloaded 720p fallback section ({mode_label}): {output_path} ({output_path.stat().st_size} bytes)")
-                return str(output_path)
-            if output_path.exists():
-                try:
-                    output_path.unlink()
-                except Exception:
-                    pass
-            if res_720p and res_720p.stderr:
-                last_err_snippet = res_720p.stderr[:300]
-        except Exception as e:
-            logger.warning(f"720p fallback failed ({mode_label}): {e}")
-            if output_path.exists():
-                try:
-                    output_path.unlink()
-                except Exception:
-                    pass
-            last_err_snippet = str(e)
+            try:
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+                if res.returncode == 0 and is_valid_mp4(output_path):
+                    logger.info(f"Successfully downloaded section ({mode_label}): {output_path} ({output_path.stat().st_size} bytes)")
+                    return str(output_path)
+                # If not valid or returncode != 0, clean up any incomplete/corrupt partial file immediately
+                if output_path.exists():
+                    try:
+                        output_path.unlink()
+                    except Exception:
+                        pass
+                last_err_snippet = res.stderr[:300] if (res and res.stderr) else "empty output or invalid file (moov atom missing)"
+            except subprocess.TimeoutExpired:
+                logger.warning(f"yt-dlp download-sections timed out after {timeout_sec}s for {clean_url} ({mode_label}).")
+                if output_path.exists():
+                    try:
+                        output_path.unlink()
+                    except Exception:
+                        pass
+                last_err_snippet = f"download-sections timed out after {timeout_sec}s due to network lag"
+            except Exception as e:
+                logger.warning(f"yt-dlp download-sections failed ({e}) ({mode_label}).")
+                if output_path.exists():
+                    try:
+                        output_path.unlink()
+                    except Exception:
+                        pass
+                last_err_snippet = str(e)
 
-        # Method 4: Fallback - Download at 480p / lowest bandwidth (guaranteed to succeed on high lag)
-        logger.info(f"Method 4: Attempting low-bandwidth 480p fallback section download for {clean_url} ({mode_label})...")
-        try:
-            if output_path.exists():
-                try:
-                    output_path.unlink()
-                except Exception:
-                    pass
-            cmd_480p = [
-                *base_cmd,
-                "--download-sections", f"*{t_start_fmt}-{t_end_fmt}",
-                "--force-keyframes-at-cuts",
-                "-f", "bestvideo[height<=480]+bestaudio/best[height<=480]/18/best",
-                "-N", "2",
-                "--socket-timeout", "20",
-                "--fragment-retries", "3",
-                "--retries", "3",
-                "-o", str(output_path),
-                "--merge-output-format", "mp4",
-                "--no-warnings",
-                clean_url
-            ]
-            timeout_480p = min(90, max(40, int(clip_duration * 2) + 20))
-            res_480p = subprocess.run(cmd_480p, capture_output=True, text=True, timeout=timeout_480p)
-            if res_480p.returncode == 0 and is_valid_mp4(output_path):
-                logger.info(f"Successfully downloaded 480p fallback section ({mode_label}): {output_path} ({output_path.stat().st_size} bytes)")
-                return str(output_path)
-            if output_path.exists():
-                try:
-                    output_path.unlink()
-                except Exception:
-                    pass
-            if res_480p and res_480p.stderr:
-                last_err_snippet = res_480p.stderr[:300]
-        except Exception as e:
-            logger.warning(f"480p fallback failed ({mode_label}): {e}")
-            if output_path.exists():
-                try:
-                    output_path.unlink()
-                except Exception:
-                    pass
-            last_err_snippet = str(e)
+            # Method 2: Fallback - Extract direct stream URLs with yt-dlp and slice using FFmpeg with network reconnect
+            logger.info(f"Direct section download fallback ({last_err_snippet}), trying stream URL trimming with auto-reconnect ({mode_label})...")
+            try:
+                if output_path.exists():
+                    try:
+                        output_path.unlink()
+                    except Exception:
+                        pass
+                url_cmd = [
+                    *base_cmd,
+                    "--socket-timeout", "20",
+                    "-g",
+                    "-f", "bestvideo[height<=1080]+bestaudio/best[height<=1080]/bestvideo+bestaudio/best",
+                    clean_url
+                ]
+                url_res = subprocess.run(url_cmd, capture_output=True, text=True, timeout=30)
+                if url_res.returncode == 0 and url_res.stdout.strip():
+                    urls = url_res.stdout.strip().split("\n")
+                    video_stream = urls[0]
+                    audio_stream = urls[1] if len(urls) > 1 else urls[0]
 
-        # If cookies were used and failed due to reload / session error or bot block, log and proceed to guest mode
-        if use_cookies:
-            logger.warning(f"Download with cookies failed ({last_err_snippet}). Automatically attempting guest mode fallback...")
+                    trim_timeout = max(240, min(900, int(clip_duration * 4.5) + 60))
+                    trim_cmd = [
+                        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                        "-reconnect", "1",
+                        "-reconnect_at_eof", "1",
+                        "-reconnect_streamed", "1",
+                        "-reconnect_delay_max", "5",
+                        "-ss", str(start_time),
+                        "-i", video_stream,
+                        "-ss", str(start_time),
+                        "-i", audio_stream,
+                        "-t", str(clip_duration),
+                        "-map", "0:v:0", "-map", "1:a:0?",
+                        *ACTIVE_ENCODER_ARGS,
+                        "-c:a", "aac",
+                        "-b:a", "192k",
+                        "-avoid_negative_ts", "make_zero",
+                        "-movflags", "+faststart",
+                        str(output_path)
+                    ]
+                    trim_res = subprocess.run(trim_cmd, capture_output=True, text=True, timeout=trim_timeout)
+                    if trim_res.returncode == 0 and is_valid_mp4(output_path):
+                        logger.info(f"Successfully trimmed stream URLs with FFmpeg ({mode_label}): {output_path} ({output_path.stat().st_size} bytes)")
+                        return str(output_path)
+                    else:
+                        if output_path.exists():
+                            try:
+                                output_path.unlink()
+                            except Exception:
+                                pass
+                        last_err_snippet = trim_res.stderr[:300] if (trim_res and trim_res.stderr) else "stream trimming failed"
+            except Exception as e:
+                logger.error(f"Fallback stream trimming failed ({mode_label}): {e}")
+                if output_path.exists():
+                    try:
+                        output_path.unlink()
+                    except Exception:
+                        pass
+                last_err_snippet = str(e)
+
+            # Method 3: Fallback - Download at 720p (vastly lower bandwidth, skips SABR/1080p throttling)
+            logger.info(f"Method 3: Attempting fast 720p fallback section download for {clean_url} ({mode_label})...")
+            try:
+                if output_path.exists():
+                    try:
+                        output_path.unlink()
+                    except Exception:
+                        pass
+                cmd_720p = [
+                    *base_cmd,
+                    "--download-sections", f"*{t_start_fmt}-{t_end_fmt}",
+                    "--force-keyframes-at-cuts",
+                    "-f", "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+                    "-N", "4",
+                    "--socket-timeout", "20",
+                    "--fragment-retries", "5",
+                    "--retries", "5",
+                    "-o", str(output_path),
+                    "--merge-output-format", "mp4",
+                    "--no-warnings",
+                    clean_url
+                ]
+                timeout_720p = max(200, min(600, int(clip_duration * 4) + 60))
+                res_720p = subprocess.run(cmd_720p, capture_output=True, text=True, timeout=timeout_720p)
+                if res_720p.returncode == 0 and is_valid_mp4(output_path):
+                    logger.info(f"Successfully downloaded 720p fallback section ({mode_label}): {output_path} ({output_path.stat().st_size} bytes)")
+                    return str(output_path)
+                if output_path.exists():
+                    try:
+                        output_path.unlink()
+                    except Exception:
+                        pass
+                if res_720p and res_720p.stderr:
+                    last_err_snippet = res_720p.stderr[:300]
+            except Exception as e:
+                logger.warning(f"720p fallback failed ({mode_label}): {e}")
+                if output_path.exists():
+                    try:
+                        output_path.unlink()
+                    except Exception:
+                        pass
+                last_err_snippet = str(e)
+
+            # Method 4: Fallback - Download at 480p / lowest bandwidth (guaranteed to succeed on high lag)
+            logger.info(f"Method 4: Attempting low-bandwidth 480p fallback section download for {clean_url} ({mode_label})...")
+            try:
+                if output_path.exists():
+                    try:
+                        output_path.unlink()
+                    except Exception:
+                        pass
+                cmd_480p = [
+                    *base_cmd,
+                    "--download-sections", f"*{t_start_fmt}-{t_end_fmt}",
+                    "--force-keyframes-at-cuts",
+                    "-f", "bestvideo[height<=480]+bestaudio/best[height<=480]/18/best",
+                    "-N", "2",
+                    "--socket-timeout", "20",
+                    "--fragment-retries", "3",
+                    "--retries", "3",
+                    "-o", str(output_path),
+                    "--merge-output-format", "mp4",
+                    "--no-warnings",
+                    clean_url
+                ]
+                timeout_480p = max(150, min(450, int(clip_duration * 3) + 45))
+                res_480p = subprocess.run(cmd_480p, capture_output=True, text=True, timeout=timeout_480p)
+                if res_480p.returncode == 0 and is_valid_mp4(output_path):
+                    logger.info(f"Successfully downloaded 480p fallback section ({mode_label}): {output_path} ({output_path.stat().st_size} bytes)")
+                    return str(output_path)
+                if output_path.exists():
+                    try:
+                        output_path.unlink()
+                    except Exception:
+                        pass
+                if res_480p and res_480p.stderr:
+                    last_err_snippet = res_480p.stderr[:300]
+            except Exception as e:
+                logger.warning(f"480p fallback failed ({mode_label}): {e}")
+                if output_path.exists():
+                    try:
+                        output_path.unlink()
+                    except Exception:
+                        pass
+                last_err_snippet = str(e)
+
+            # If cookies were used and failed due to reload / session error or bot block, log and proceed to guest mode
+            if use_cookies:
+                logger.warning(f"Download with cookies failed ({last_err_snippet}). Automatically attempting guest mode fallback...")
 
     # Ensure any corrupt partial file is unlinked
     if output_path.exists():
@@ -925,7 +1157,12 @@ def download_clip_segment(
     raise RuntimeError(f"Failed to download video clip segment from YouTube ({last_err_snippet}). Check your internet connection or cookies.")
 
 
-def download_full_raw_video(video_url: str, output_path: str, progress_callback=None) -> str:
+def download_full_raw_video(
+    video_url: str,
+    output_path: Union[str, Path],
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    cookies_content: Optional[str] = None
+) -> str:
     """
     Downloads the full raw video from YouTube in maximum quality (up to 1080p),
     or copies the local uploaded / Google Drive video file directly.
@@ -937,8 +1174,10 @@ def download_full_raw_video(video_url: str, output_path: str, progress_callback=
         candidate = UPLOADS_DIR / os.path.basename(video_url.split("?")[0])
         if candidate.exists():
             local_source = candidate
-    elif (UPLOADS_DIR / os.path.basename(video_url.split("?")[0])).exists():
-        local_source = UPLOADS_DIR / os.path.basename(video_url.split("?")[0])
+    if not local_source or not local_source.exists():
+        clean_name = os.path.basename(video_url.split("?")[0]).strip()
+        from backend.routers.media import _find_video_file_on_disk
+        local_source = _find_video_file_on_disk(clean_name)
 
     if local_source and local_source.exists():
         logger.info(f"Copying local source video to raw output: {local_source} -> {output_path}")
@@ -951,74 +1190,75 @@ def download_full_raw_video(video_url: str, output_path: str, progress_callback=
     if not clean_url.startswith("http"):
         clean_url = f"https://www.youtube.com/watch?v={clean_url}"
 
-    has_cookies = get_effective_cookies_path() is not None
-    attempts = [True, False] if has_cookies else [False]
+    with ephemeral_cookies_file(cookies_content) as temp_cookies:
+        has_cookies = temp_cookies is not None or get_effective_cookies_path() is not None
+        attempts = [True, False] if has_cookies else [False]
 
-    for use_cookies in attempts:
-        base_cmd = get_yt_dlp_base_cmd(include_cookies=use_cookies)
-        mode_label = "with cookies" if use_cookies else "guest mode (without cookies)"
-        cmd = [
-            *base_cmd,
-            "--no-colors",
-            "-f", "bestvideo[height<=1080]+bestaudio/best[height<=1080]/bestvideo+bestaudio/best",
-            "-o", str(output_path),
-            "--merge-output-format", "mp4",
-            "--newline",
-            "--progress-template", "download:%(progress._percent_str)s|%(progress._downloaded_bytes_str)s|%(progress._total_bytes_str)s|%(progress._speed_str)s|%(progress._eta_str)s",
-            clean_url
-        ]
-        logger.info(f"Downloading full raw video ({mode_label}) from {clean_url} to {output_path}...")
+        for use_cookies in attempts:
+            base_cmd = get_yt_dlp_base_cmd(include_cookies=use_cookies, cookies_path=temp_cookies if use_cookies else None)
+            mode_label = "with cookies" if use_cookies else "guest mode (without cookies)"
+            cmd = [
+                *base_cmd,
+                "--no-colors",
+                "-f", "bestvideo[height<=1080]+bestaudio/best[height<=1080]/bestvideo+bestaudio/best",
+                "-o", str(output_path),
+                "--merge-output-format", "mp4",
+                "--newline",
+                "--progress-template", "download:%(progress._percent_str)s|%(progress._downloaded_bytes_str)s|%(progress._total_bytes_str)s|%(progress._speed_str)s|%(progress._eta_str)s",
+                clean_url
+            ]
+            logger.info(f"Downloading full raw video ({mode_label}) from {clean_url} to {output_path}...")
 
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-        for line in iter(process.stdout.readline, ''):
-            raw_line = line.strip()
-            if not raw_line:
-                continue
-            clean_line = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', raw_line).strip()
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            for line in iter(process.stdout.readline, ''):
+                raw_line = line.strip()
+                if not raw_line:
+                    continue
+                clean_line = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', raw_line).strip()
 
-            if clean_line.startswith("download:") and progress_callback:
-                raw_data = clean_line[len("download:"):].strip()
-                parts = raw_data.split("|")
-                if len(parts) >= 5:
-                    pct_str, dl_str, tot_str, spd_str, eta_str = parts[0], parts[1], parts[2], parts[3], parts[4]
-                    try:
-                        clean_pct = re.sub(r'[^0-9.]', '', pct_str)
-                        pct_val = float(clean_pct) if clean_pct else 0.0
-                    except Exception:
-                        pct_val = 0.0
-                    progress_callback({
-                        "percent": pct_val,
-                        "downloaded": dl_str.strip() if dl_str and dl_str != "NA" else f"{pct_val:.1f}%",
-                        "total": tot_str.strip() if tot_str and tot_str != "NA" else "",
-                        "speed": spd_str.strip() if spd_str and spd_str != "NA" else "",
-                        "eta": eta_str.strip() if eta_str and eta_str != "NA" else ""
-                    })
-            elif "[download]" in clean_line and progress_callback:
-                match = re.search(r'([0-9]+(?:\.[0-9]+)?)\s*%', clean_line)
-                if match:
-                    try:
-                        pct_val = float(match.group(1))
-                    except Exception:
-                        pct_val = 0.0
-                    spd_match = re.search(r'at\s+([0-9.]+\s*[a-zA-Z]+/s)', clean_line)
-                    eta_match = re.search(r'ETA\s+([0-9:]+)', clean_line)
-                    tot_match = re.search(r'of\s+~?([0-9.]+\s*[a-zA-Z]+)', clean_line)
-                    progress_callback({
-                        "percent": pct_val,
-                        "downloaded": f"{pct_val:.1f}%",
-                        "total": tot_match.group(1) if tot_match else "",
-                        "speed": spd_match.group(1) if spd_match else "",
-                        "eta": eta_match.group(1) if eta_match else ""
-                    })
-        process.stdout.close()
-        returncode = process.wait()
+                if clean_line.startswith("download:") and progress_callback:
+                    raw_data = clean_line[len("download:"):].strip()
+                    parts = raw_data.split("|")
+                    if len(parts) >= 5:
+                        pct_str, dl_str, tot_str, spd_str, eta_str = parts[0], parts[1], parts[2], parts[3], parts[4]
+                        try:
+                            clean_pct = re.sub(r'[^0-9.]', '', pct_str)
+                            pct_val = float(clean_pct) if clean_pct else 0.0
+                        except Exception:
+                            pct_val = 0.0
+                        progress_callback({
+                            "percent": pct_val,
+                            "downloaded": dl_str.strip() if dl_str and dl_str != "NA" else f"{pct_val:.1f}%",
+                            "total": tot_str.strip() if tot_str and tot_str != "NA" else "",
+                            "speed": spd_str.strip() if spd_str and spd_str != "NA" else "",
+                            "eta": eta_str.strip() if eta_str and eta_str != "NA" else ""
+                        })
+                elif "[download]" in clean_line and progress_callback:
+                    match = re.search(r'([0-9]+(?:\.[0-9]+)?)\s*%', clean_line)
+                    if match:
+                        try:
+                            pct_val = float(match.group(1))
+                        except Exception:
+                            pct_val = 0.0
+                        spd_match = re.search(r'at\s+([0-9.]+\s*[a-zA-Z]+/s)', clean_line)
+                        eta_match = re.search(r'ETA\s+([0-9:]+)', clean_line)
+                        tot_match = re.search(r'of\s+~?([0-9.]+\s*[a-zA-Z]+)', clean_line)
+                        progress_callback({
+                            "percent": pct_val,
+                            "downloaded": f"{pct_val:.1f}%",
+                            "total": tot_match.group(1) if tot_match else "",
+                            "speed": spd_match.group(1) if spd_match else "",
+                            "eta": eta_match.group(1) if eta_match else ""
+                        })
+            process.stdout.close()
+            returncode = process.wait()
 
-        if os.path.exists(output_path) and os.path.getsize(output_path) > 10000:
-            logger.info(f"Full raw video downloaded successfully ({mode_label}, {os.path.getsize(output_path)} bytes)")
-            return str(output_path)
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 10000:
+                logger.info(f"Full raw video downloaded successfully ({mode_label}, {os.path.getsize(output_path)} bytes)")
+                return str(output_path)
 
-        if use_cookies:
-            logger.warning(f"Full raw video download with cookies exited with code {returncode}. Retrying in guest mode...")
+            if use_cookies:
+                logger.warning(f"Full raw video download with cookies exited with code {returncode}. Retrying in guest mode...")
 
     raise RuntimeError("Failed to download raw video. Please check your cookies or network connection.")
 
@@ -1037,11 +1277,17 @@ def clean_caption_text(text: str) -> str:
     t = re.sub(r'\[.*?\]|\(.*?\)|[\*].*?[\*]', ' ', text)
     # 2. Remove common unbracketed sound tags
     t = re.sub(r'\b(laughter|applause|music|cheering|snickering|giggle|cough)\b', ' ', t, flags=re.IGNORECASE)
-    # 3. Remove all symbols except . , % & $ ? (keep letters, digits, whitespace, . , % & $ ?)
+    # 3. Strip leading and trailing ellipses / periods (e.g. "...Stroavirus..." -> "Stroavirus")
+    t = re.sub(r'^\s*[\.\,\…\:\;]+\s*', '', t)
+    t = re.sub(r'\s*[\.\,\…\:\;]+\s*$', '', t)
+    # 4. Remove all symbols except . , % & $ ? (keep letters, digits, whitespace, . , % & $ ?)
     # Note: in Python regex \w includes '_', so we explicitly eliminate '_'
     t = re.sub(r'[^\w\s.,%&$?]|_', '', t)
-    # 4. Collapse multiple spaces
+    # 5. Collapse multiple spaces and trim
     t = re.sub(r'\s+', ' ', t).strip()
+    # If the string consists purely of punctuation, clear it
+    if re.fullmatch(r'[\.\,\%\&\$\? ]+', t):
+        return ""
     return t
 
 
@@ -1049,15 +1295,117 @@ def transcribe_clip_words(
     video_path: str,
     fallback_transcript: Optional[List[Dict[str, Any]]] = None,
     clip_start_time: float = 0.0,
-    clip_end_time: float = 0.0
+    clip_end_time: float = 0.0,
+    target_language: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     """
-    Extracts word-level timestamps using the analyzed video transcript.
-    This guarantees 100% fidelity with the analyzed speech (no mis-speech or Whisper hallucinations).
-    Timestamps are mapped relative to the sliced clip audio (0.0s = clip_start_time).
-    Whisper is only used as a fallback if no video transcript is available.
+    Transcribes word-level timestamps directly from the sliced clip audio using Whisper AI.
+    Listens directly to the audio waveform of the sliced clip (0.0s = start of clip) for 100% acoustic accuracy.
+    Applies explicit language constraints, custom Indonesian/English initial prompt context,
+    condition_on_previous_text=False, and hallucination suppression to eliminate phantom/corrupted words.
+    Falls back to transcript distribution only if Whisper AI is not available.
     """
-    # 1. Primary: Use the analyzed video transcript (exact matches from YouTube / Whisper)
+    # Auto-detect language from fallback transcript if not explicitly provided
+    if not target_language and fallback_transcript:
+        try:
+            from backend.utils.text import detect_transcript_language
+            detected = detect_transcript_language(fallback_transcript[:50])
+            if detected and detected.get("code") in ("id", "en"):
+                target_language = detected["code"]
+        except Exception:
+            pass
+
+    # 1. Primary: Run Whisper directly on sliced clip audio for exact acoustic timestamps
+    whisper_model = get_whisper_model()
+    if whisper_model is not None and os.path.exists(video_path):
+        try:
+            logger.info(f"Running Whisper acoustic word transcription on: {os.path.basename(video_path)} (target_language={target_language})...")
+
+            # Extract dialogue context from fallback transcript for this time window to guide Whisper decoding
+            context_hint = ""
+            if fallback_transcript and clip_end_time > clip_start_time:
+                matching_lines = [
+                    l.get("text", "").strip() for l in fallback_transcript
+                    if float(l.get("start", 0.0)) <= clip_end_time + 1.0 and float(l.get("end", l.get("start", 0.0) + l.get("duration", 2.0))) >= clip_start_time - 1.0
+                ]
+                if matching_lines:
+                    context_hint = " ".join(matching_lines[:6])[:200]
+
+            if target_language == "id":
+                base_prompt = "Transkrip percakapan video dalam Bahasa Indonesia. Kosakata percakapan, gaming, dan santai."
+            elif target_language == "en":
+                base_prompt = "Video dialogue transcript in English. Conversational, gaming, and clear speech."
+            else:
+                base_prompt = "Transkrip video percakapan Bahasa Indonesia atau English."
+
+            initial_prompt = f"{base_prompt} {context_hint}".strip() if context_hint else base_prompt
+
+            transcribe_kwargs: Dict[str, Any] = {
+                "word_timestamps": True,
+                "fp16": False,
+                "verbose": False,
+                "condition_on_previous_text": False,  # Prevents repetition loops and hallucinations across silence
+                "hallucination_silence_threshold": 1.5,
+                "initial_prompt": initial_prompt,
+            }
+            if target_language in ("id", "en"):
+                transcribe_kwargs["language"] = target_language
+
+            result = None
+            with _WHISPER_LOCK:
+                try:
+                    result = whisper_model.transcribe(
+                        video_path,
+                        **transcribe_kwargs
+                    )
+                except RuntimeError as re_err:
+                    logger.warning(f"Whisper word_timestamps failed ({re_err}). Retrying with standard segment timestamps...")
+                    transcribe_kwargs["word_timestamps"] = False
+                    result = whisper_model.transcribe(
+                        video_path,
+                        **transcribe_kwargs
+                    )
+
+            words = []
+            if result:
+                for segment in result.get("segments", []):
+                    seg_words = segment.get("words", [])
+                    if seg_words:
+                        for w in seg_words:
+                            word_clean = clean_caption_text(w.get("word", "").strip())
+                            # Skip ellipses, single punctuation, or empty tokens
+                            if word_clean and word_clean not in (".", "..", "...", ",", "?"):
+                                st = max(0.0, float(w.get("start", 0.0)))
+                                et = max(st + 0.12, float(w.get("end", st + 0.25)))
+                                words.append({
+                                    "word": word_clean,
+                                    "start": round(st, 2),
+                                    "end": round(et, 2)
+                                })
+                    else:
+                        # Segment timestamps fallback: interpolate words across start and end
+                        seg_text = clean_caption_text(segment.get("text", "").strip())
+                        seg_st = max(0.0, float(segment.get("start", 0.0)))
+                        seg_et = max(seg_st + 0.5, float(segment.get("end", seg_st + 2.0)))
+                        tokens = seg_text.split()
+                        if tokens:
+                            step_dur = (seg_et - seg_st) / len(tokens)
+                            for idx, tok in enumerate(tokens):
+                                w_st = seg_st + (idx * step_dur)
+                                w_et = w_st + max(0.15, step_dur * 0.95)
+                                words.append({
+                                    "word": tok,
+                                    "start": round(w_st, 2),
+                                    "end": round(w_et, 2)
+                                })
+
+            if words:
+                logger.info(f"Whisper successfully transcribed {len(words)} acoustic words for clip.")
+                return words
+        except Exception as e:
+            logger.warning(f"Whisper acoustic transcription error: {e}")
+
+    # 2. Secondary fallback: Use fallback_transcript if Whisper model is unavailable
     if fallback_transcript:
         words = []
         for line in fallback_transcript:
@@ -1078,66 +1426,30 @@ def transcribe_clip_words(
                 words_cnt = max(1, len(cleaned_line.split()))
                 l_end = l_start + max(1.8, words_cnt * 0.38)
 
-            # If clip range is defined, filter lines overlapping the clip
             if clip_end_time > clip_start_time:
-                if l_end <= clip_start_time or l_start >= clip_end_time:
+                if l_end < clip_start_time - 0.2 or l_start > clip_end_time + 0.2:
                     continue
+                rel_start = max(0.0, l_start - clip_start_time)
+                rel_end = max(rel_start + 0.15, l_end - clip_start_time)
+            else:
+                rel_start = max(0.0, l_start)
+                rel_end = max(rel_start + 0.15, l_end)
 
             line_words = cleaned_line.split()
             if not line_words:
                 continue
-
-            # Distribute words realistically across the line duration based on character length
-            line_dur = max(0.2, l_end - l_start)
-            total_chars = max(1, sum(max(1, len(w)) for w in line_words))
-            cur_time = l_start
-
+            w_duration = max(0.12, (rel_end - rel_start) / len(line_words))
             for i, w in enumerate(line_words):
-                w_dur = max(0.15, (max(1, len(w)) / total_chars) * line_dur)
-                w_s_global = cur_time
-                w_e_global = cur_time + w_dur
-                cur_time = w_e_global
-
-                if clip_end_time > clip_start_time:
-                    # Exclude words that fall completely outside the clip
-                    if w_e_global <= clip_start_time or w_s_global >= clip_end_time:
-                        continue
-                    w_s = max(0.0, w_s_global - clip_start_time)
-                    w_e = max(w_s + 0.12, min(clip_end_time - clip_start_time, w_e_global - clip_start_time))
-                else:
-                    w_s = max(0.0, w_s_global)
-                    w_e = max(w_s + 0.12, w_e_global)
-
+                w_s = rel_start + (i * w_duration)
+                w_e = w_s + w_duration
                 words.append({
                     "word": w,
                     "start": round(w_s, 2),
                     "end": round(w_e, 2)
                 })
         if words:
-            logger.info(f"Using analyzed video transcript: mapped {len(words)} words for clip range [{clip_start_time:.1f}s -> {clip_end_time:.1f}s].")
+            logger.info(f"Fallback: using transcript words for clip range [{clip_start_time:.1f}s -> {clip_end_time:.1f}s].")
             return words
-
-    # 2. Secondary fallback: Whisper if no transcript was returned from YouTube
-    whisper_model = get_whisper_model()
-    if whisper_model is not None:
-        try:
-            logger.info("Running Whisper word-level transcription as fallback...")
-            result = whisper_model.transcribe(video_path, word_timestamps=True, fp16=False)
-            words = []
-            for segment in result.get("segments", []):
-                for w in segment.get("words", []):
-                    word_clean = clean_caption_text(w.get("word", "").strip())
-                    if word_clean:
-                        words.append({
-                            "word": word_clean,
-                            "start": max(0.0, float(w.get("start", 0.0))),
-                            "end": max(float(w.get("start", 0.0)) + 0.1, float(w.get("end", 0.0)))
-                        })
-            if words:
-                logger.info(f"Whisper transcribed {len(words)} words successfully.")
-                return words
-        except Exception as e:
-            logger.warning(f"Whisper word transcription error: {e}")
 
     return []
 
@@ -1299,6 +1611,100 @@ def get_emoji_font(size: int) -> Optional[ImageFont.FreeTypeFont]:
     return None
 
 
+def get_ffmpeg_safe_font_path(font_name: str = "Montserrat") -> str:
+    """Returns an escaped font file path safe for FFmpeg drawtext filter to avoid Fontconfig errors on Windows."""
+    fonts_dir = Path(FONTS_DIR)
+    clean_name = font_name.replace(".ttf", "").replace(".otf", "").strip() if font_name else "Montserrat"
+    candidates = [
+        fonts_dir / f"{clean_name}.ttf",
+        fonts_dir / f"{clean_name}.otf",
+        fonts_dir / "Montserrat.ttf",
+        fonts_dir / "Inter.ttf",
+        fonts_dir / "Poppins.ttf",
+        fonts_dir / "Bebas Neue.ttf",
+        fonts_dir / "Anton.ttf",
+    ]
+    for c in candidates:
+        if c.exists():
+            clean = str(c.resolve()).replace("\\", "/")
+            return clean.replace(":", "\\:")
+    win_font = Path("C:/Windows/Fonts/arial.ttf")
+    if win_font.exists():
+        clean = str(win_font.resolve()).replace("\\", "/")
+        return clean.replace(":", "\\:")
+    return ""
+
+
+def render_text_watermark_png(
+    text: str,
+    output_png_path: str,
+    font_name: str = "Montserrat",
+    font_size: int = 48,
+    font_color: Tuple[int, int, int] = (255, 255, 255),
+    border_color: Tuple[int, int, int] = (0, 0, 0),
+    border_width: int = 2
+) -> Optional[str]:
+    """
+    Renders text watermark (handles, usernames, hashtags, emojis) to a transparent PNG.
+    Guarantees 100% immune to Fontconfig errors on Windows/Linux/Docker and supports color emojis.
+    """
+    clean_text = str(text or "").strip()
+    if not clean_text:
+        return None
+
+    # Resolve fonts
+    text_font = get_font(font_name, font_size)
+    emoji_font = get_emoji_font(int(font_size * 0.90))
+
+    # Measure segments
+    segments = split_text_and_emojis(clean_text)
+    if not segments:
+        segments = [('text', clean_text)]
+
+    temp_img = Image.new("RGBA", (10, 10), (0, 0, 0, 0))
+    temp_draw = ImageDraw.Draw(temp_img)
+
+    seg_widths = []
+    max_h = 0
+    for kind, chunk in segments:
+        f = emoji_font if (kind == 'emoji' and emoji_font) else text_font
+        bbox = temp_draw.textbbox((0, 0), chunk, font=f)
+        w = max(1, bbox[2] - bbox[0])
+        h = max(1, bbox[3] - bbox[1])
+        seg_widths.append(w)
+        max_h = max(max_h, h)
+
+    total_w = sum(seg_widths)
+    pad = max(6, int(font_size * 0.20))
+    canvas_w = total_w + (pad * 2) + (border_width * 4)
+    canvas_h = max_h + (pad * 2) + (border_width * 4)
+
+    img = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    cur_x = pad + border_width
+    y_pos = pad + border_width
+
+    # Draw text outline and fills
+    for (kind, chunk), w in zip(segments, seg_widths):
+        if kind == 'emoji' and emoji_font:
+            draw.text((cur_x, y_pos), chunk, font=emoji_font, embedded_color=True)
+        else:
+            draw.text(
+                (cur_x, y_pos),
+                chunk,
+                font=text_font,
+                fill=(*font_color, 255),
+                stroke_width=max(1, border_width),
+                stroke_fill=(*border_color, 230)
+            )
+        cur_x += w
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_png_path)), exist_ok=True)
+    img.save(output_png_path, "PNG")
+    return output_png_path
+
+
 def render_title_overlay_png(
     title_text: str,
     output_png_path: str,
@@ -1311,7 +1717,10 @@ def render_title_overlay_png(
     canvas_w: int = 1080,
     canvas_h: int = 1920,
     title_font_size_preset: Optional[str] = None,
-    streamer_preset: Optional[str] = "none"
+    streamer_preset: Optional[str] = "none",
+    title_font_name: Optional[str] = None,
+    title_font_size_px: Optional[int] = None,
+    title_text_case: Optional[str] = None
 ) -> Optional[str]:
     """
     Renders the title with full-color emojis and bold styled typography into a transparent
@@ -1320,6 +1729,8 @@ def render_title_overlay_png(
     if not title_text or title_position == "none":
         return None
 
+    effective_title_font = title_font_name or font_name or "Montserrat"
+    effective_title_case = title_text_case or text_case or "uppercase"
     effective_title_preset = (title_font_size_preset or font_size_preset or "medium").lower()
 
     if effective_title_preset == "small":
@@ -1331,15 +1742,21 @@ def render_title_overlay_png(
 
     # Format Title & Determine Line Count
     formatted_title, title_line_count = wrap_title_smart(
-        apply_text_case(title_text, text_case),
+        apply_text_case(title_text, effective_title_case),
         max_single_len=max_wrap_len
     )
 
     if not formatted_title:
         return None
 
-    # Distinct, calibrated title font sizes based on preset
-    if effective_title_preset == "small":
+    # Distinct, calibrated title font sizes based on preset or explicit px
+    # Scaled by 1.30x so export perfectly matches the live framing preview (WYSIWYG)
+    if title_font_size_px and int(title_font_size_px) > 0:
+        if target_aspect_ratio == "16:9_landscape":
+            title_font_size = max(24, int(round(int(title_font_size_px) * 1.30 * (1080 / 1920))))
+        else:
+            title_font_size = max(24, int(round(int(title_font_size_px) * 1.30)))
+    elif effective_title_preset == "small":
         title_font_size = 58 if title_line_count >= 3 else 68
     elif effective_title_preset == "big":
         title_font_size = 106 if title_line_count >= 3 else 124
@@ -1348,7 +1765,7 @@ def render_title_overlay_png(
 
     # Create dummy draw to measure line widths and prevent edge overflow
     temp_draw = ImageDraw.Draw(Image.new("RGBA", (canvas_w, canvas_h)))
-    text_font = get_font(font_name, title_font_size)
+    text_font = get_font(effective_title_font, title_font_size)
     emoji_font = get_emoji_font(int(title_font_size * 0.90))
 
     lines = [l.strip() for l in formatted_title.split("\\N") if l.strip()]
@@ -1400,7 +1817,7 @@ def render_title_overlay_png(
             content_top = 0
             content_bot = 1920
 
-    line_step = int(title_font_size * 0.86)
+    line_step = int(title_font_size * 1.08)
     est_title_h = int(title_line_count * line_step)
 
     # Title Positioning (100% WYSIWYG matching framing preview):
@@ -1518,7 +1935,11 @@ def generate_ass_file(
     subtitle_center_y_percent: float = 50.0,
     skip_title: bool = False,
     title_font_size_preset: Optional[str] = None,
-    streamer_preset: Optional[str] = "none"
+    streamer_preset: Optional[str] = "none",
+    title_font_name: Optional[str] = None,
+    font_size_px: Optional[int] = None,
+    title_font_size_px: Optional[int] = None,
+    title_text_case: Optional[str] = None
 ) -> str:
     """
     Generates an Advanced SubStation Alpha (.ass) subtitle and title file with karaoke / word-level animation.
@@ -1528,6 +1949,7 @@ def generate_ass_file(
     Supports subtitle_position_mode ('bottom' | 'center') with custom center Y position.
     """
     effective_title_preset = (title_font_size_preset or font_size_preset or "medium").lower()
+    effective_title_case = title_text_case or text_case or "uppercase"
 
     if effective_title_preset == "small":
         max_wrap_len = 24
@@ -1538,7 +1960,7 @@ def generate_ass_file(
 
     # 1. Format Title & Determine Line Count
     if title_text and title_position != "none":
-        sanitized_title = escape_ass_text(apply_text_case(title_text, text_case))
+        sanitized_title = escape_ass_text(apply_text_case(title_text, effective_title_case))
         formatted_title, title_line_count = wrap_title_smart(
             sanitized_title,
             max_single_len=max_wrap_len
@@ -1575,11 +1997,19 @@ def generate_ass_file(
             sub_font_size = 78
 
         if effective_title_preset == "small":
-            title_font_size = 58 if title_line_count >= 3 else 68
+            title_font_size = 65 if title_line_count >= 3 else 68
         elif effective_title_preset == "big":
             title_font_size = 106 if title_line_count >= 3 else 124
         else:  # medium
-            title_font_size = 82 if title_line_count >= 3 else 94
+            title_font_size = 85 if title_line_count >= 3 else 94
+
+    if font_size_px and int(font_size_px) > 0:
+        sub_font_size = int(font_size_px)
+    if title_font_size_px and int(title_font_size_px) > 0:
+        if is_landscape:
+            title_font_size = max(24, int(round(int(title_font_size_px) * 1.30 * (1080 / 1920))))
+        else:
+            title_font_size = max(24, int(round(int(title_font_size_px) * 1.30)))
 
     # 3. Content boundaries for aspect ratios
     if is_landscape:
@@ -1609,11 +2039,27 @@ def generate_ass_file(
             content_top = 0
             content_bot = 1920
 
-    # Tight line height step (0.86x) for close, compact multi-line title layout
-    line_step = int(title_font_size * 0.86)
+    # Title line step matching 1.08x line height of live preview CSS box model
+    line_step = int(title_font_size * 1.08)
     est_title_h = int(title_line_count * line_step)
     est_sub_h = int(sub_font_size * 1.08)
     sub_align = 5 if subtitle_position_mode == "center" else 2
+
+    # Ensure title line width does not overflow screen edges in ASS
+    title_lines_check = [l.strip() for l in formatted_title.split("\\N") if l.strip()]
+    if title_lines_check:
+        max_allowed_w = canvas_w - 70
+        test_font = get_font(title_font_name or font_name, title_font_size)
+        temp_draw = ImageDraw.Draw(Image.new("RGBA", (canvas_w, canvas_h)))
+        max_w = 0
+        for tl in title_lines_check:
+            bbox = temp_draw.textbbox((0, 0), tl, font=test_font)
+            max_w = max(max_w, bbox[2] - bbox[0])
+        if max_w > max_allowed_w and max_w > 0:
+            scale_factor = max_allowed_w / max_w
+            title_font_size = max(30, int(title_font_size * scale_factor))
+            line_step = int(title_font_size * 1.08)
+            est_title_h = int(title_line_count * line_step)
 
     # Title Positioning (100% WYSIWYG matching framing preview):
     if is_landscape:
@@ -1730,7 +2176,7 @@ Collisions: Reverse
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: TitleStyle,{font_name},{title_font_size},&H00FFFFFF,&H000000FF,&H00000000,{title_box_back},-1,0,0,0,100,100,0,0,{title_border_style},4.4,2.0,8,40,40,0,1
+Style: TitleStyle,{title_font_name or font_name},{title_font_size},&H00FFFFFF,&H000000FF,&H00000000,{title_box_back},-1,0,0,0,100,100,0,0,{title_border_style},4.4,2.0,8,40,40,0,1
 Style: SubStyle,{font_name},{sub_font_size},{primary_color},&H000000FF,{outline_color},{back_color},-1,0,0,0,100,100,0,0,1,{outline_w},{shadow_w},2,40,40,0,1
 
 [Events]
@@ -1751,8 +2197,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
         end_time_str = format_ass_timestamp(t_end_sec)
         title_lines = [l.strip() for l in formatted_title.split("\\N") if l.strip()]
+        base_ass_y = max(10, title_y - int(title_font_size * 0.15))
         for line_idx, t_line in enumerate(title_lines):
-            line_y = title_y + (line_idx * line_step)
+            line_y = base_ass_y + (line_idx * line_step)
             events.append(
                 f"Dialogue: 1,0:00:00.00,{end_time_str},TitleStyle,,0,0,0,,{{\\q2\\an8\\pos({center_x},{line_y})}}{t_line}"
             )
@@ -1767,18 +2214,21 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 continue
             w_text = escape_ass_text(apply_text_case(raw_text, text_case))
             st = max(0.0, float(w.get("start", 0.0)))
-            et = max(st + 0.08, float(w.get("end", st + 0.25)))
+            et = max(st + 0.15, float(w.get("end", st + 0.25)))
             valid_words.append({"word_text": w_text, "start": st, "end": et, "raw": w})
 
         valid_words.sort(key=lambda x: x["start"])
 
-        # Step B: Pack into compact chunks (1 to 3 words, max 16 chars) to strictly guarantee 1 single line
+        # Step B: Pack into compact chunks (1 to 3 words, max 22 chars) to strictly guarantee 1 single line
+        # Split on natural speech pauses (>= 0.38s) or sentence-ending punctuation so words don't hang over silences
         chunks = []
         current_chunk = []
         current_chars = 0
         for item in valid_words:
             w_len = len(item["word_text"])
-            if len(current_chunk) >= 3 or (current_chunk and (current_chars + w_len > 16)):
+            has_pause = bool(current_chunk and (item["start"] - current_chunk[-1]["end"] >= 0.38))
+            ends_sentence = bool(current_chunk and any(current_chunk[-1]["word_text"].endswith(p) for p in [".", "?", "!"]))
+            if len(current_chunk) >= 3 or has_pause or ends_sentence or (current_chunk and (current_chars + w_len > 22)):
                 chunks.append(current_chunk)
                 current_chunk = [item]
                 current_chars = w_len
@@ -1792,27 +2242,30 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         chunk_bounds = []
         for chunk in chunks:
             c_start = chunk[0]["start"]
-            c_end = max(c_start + 0.25, chunk[-1]["end"])
+            c_end = max(c_start + 0.35, chunk[-1]["end"] + 0.12)
             if chunk_bounds:
                 prev_end = chunk_bounds[-1][1]
                 if c_start < prev_end:
                     c_start = prev_end
                 if c_end <= c_start:
-                    c_end = c_start + 0.25
+                    c_end = c_start + 0.28
             chunk_bounds.append((c_start, c_end))
 
         # Clamp against subsequent chunk start times to eliminate any inter-chunk overlaps
         for i in range(len(chunk_bounds) - 1):
             cur_s, cur_e = chunk_bounds[i]
-            nxt_s, _ = chunk_bounds[i + 1]
+            nxt_s, nxt_e = chunk_bounds[i + 1]
             if cur_e > nxt_s:
-                chunk_bounds[i] = (cur_s, nxt_s)
+                split_pt = max(cur_s + 0.28, nxt_s)
+                chunk_bounds[i] = (cur_s, split_pt)
+                if nxt_s < split_pt:
+                    chunk_bounds[i + 1] = (split_pt, max(split_pt + 0.28, nxt_e))
 
         # Step D: Partition each chunk into strictly contiguous active-word time slices
         for chunk_idx, chunk in enumerate(chunks):
             c_start, c_end = chunk_bounds[chunk_idx]
             if c_end <= c_start:
-                c_end = c_start + 0.20
+                c_end = c_start + 0.25
             num_words = len(chunk)
 
             if num_words == 1:
@@ -1821,8 +2274,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 points = [c_start]
                 for w_i in range(1, num_words):
                     raw_st = chunk[w_i]["start"]
-                    min_allowed = points[-1] + 0.08
-                    max_allowed = c_end - 0.08 * (num_words - w_i)
+                    # Enforce minimum 0.16s per word to eliminate micro-flickering while preserving acoustic sync
+                    min_allowed = points[-1] + 0.16
+                    max_allowed = c_end - 0.16 * (num_words - w_i)
                     if min_allowed > max_allowed:
                         pt = points[-1] + (c_end - points[-1]) / (num_words - w_i + 1)
                     else:
@@ -2171,13 +2625,14 @@ def detect_speaker_face_box(
 
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        step = max(1, total_frames // 25) if total_frames > 25 else max(1, int(fps * 0.75))
+        # Low-CPU keyframe sampling: 10 frames are sufficient for spatial clustering without loading server CPU
+        step = max(1, total_frames // 10) if total_frames > 10 else max(1, int(fps * 1.5))
 
         detections = []
         sampled_small_frames = []
         frame_idx = 0
         checked = 0
-        while cap.isOpened() and frame_idx < total_frames and checked < 25:
+        while cap.isOpened() and frame_idx < total_frames and checked < 10:
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ret, frame = cap.read()
             frame_idx += step
@@ -2353,7 +2808,7 @@ def build_ffmpeg_filtergraph(
             )
             if background_style == "blurred":
                 filters.append(
-                    f"[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:5,eq=saturation=1.2:contrast=1.05[bg_blurred];"
+                    f"[0:v]scale=360:640:force_original_aspect_ratio=increase,crop=360:640,boxblur=12:2,scale=1080:1920,eq=saturation=1.2:contrast=1.05[bg_blurred];"
                     f"[bg_blurred][both_split]overlay=0:352[layout_base]"
                 )
             else:
@@ -2373,7 +2828,7 @@ def build_ffmpeg_filtergraph(
             )
             if background_style == "blurred":
                 filters.append(
-                    f"[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:5,eq=saturation=1.2:contrast=1.05[bg_blurred];"
+                    f"[0:v]scale=360:640:force_original_aspect_ratio=increase,crop=360:640,boxblur=12:2,scale=1080:1920,eq=saturation=1.2:contrast=1.05[bg_blurred];"
                     f"[bg_blurred][both_split]overlay=60:0[layout_base]"
                 )
             else:
@@ -2393,7 +2848,7 @@ def build_ffmpeg_filtergraph(
             )
             if background_style == "blurred":
                 filters.append(
-                    f"[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:5,eq=saturation=1.2:contrast=1.05[bg_blurred];"
+                    f"[0:v]scale=360:640:force_original_aspect_ratio=increase,crop=360:640,boxblur=12:2,scale=1080:1920,eq=saturation=1.2:contrast=1.05[bg_blurred];"
                     f"[bg_blurred][both_split]overlay=0:150[layout_base]"
                 )
             else:
@@ -2434,7 +2889,7 @@ def build_ffmpeg_filtergraph(
             if background_style == "blurred":
                 filters.append(
                     f"[0:v]split=3[bg_raw][main_raw][pip_raw];"
-                    f"[bg_raw]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:5,eq=saturation=1.2:contrast=1.05[bg_blurred];"
+                    f"[bg_raw]scale=360:640:force_original_aspect_ratio=increase,crop=360:640,boxblur=12:2,scale=1080:1920,eq=saturation=1.2:contrast=1.05[bg_blurred];"
                     f"[main_raw]{crop_main}[fg_square];"
                     f"[bg_blurred][fg_square]overlay=0:420[main_base];"
                     f"{pip_crop}"
@@ -2454,7 +2909,7 @@ def build_ffmpeg_filtergraph(
             if background_style == "blurred":
                 filters.append(
                     f"[0:v]split=3[bg_raw][main_raw][pip_raw];"
-                    f"[bg_raw]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:5,eq=saturation=1.2:contrast=1.05[bg_blurred];"
+                    f"[bg_raw]scale=360:640:force_original_aspect_ratio=increase,crop=360:640,boxblur=12:2,scale=1080:1920,eq=saturation=1.2:contrast=1.05[bg_blurred];"
                     f"[main_raw]{crop_main}[fg_43];"
                     f"[bg_blurred][fg_43]overlay=0:555[main_base];"
                     f"{pip_crop}"
@@ -2484,7 +2939,7 @@ def build_ffmpeg_filtergraph(
             if background_style == "blurred":
                 filters.append(
                     f"[0:v]split=3[bg_raw][main_raw][pip_raw];"
-                    f"[bg_raw]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:5,eq=saturation=1.2:contrast=1.05[bg_blurred];"
+                    f"[bg_raw]scale=360:640:force_original_aspect_ratio=increase,crop=360:640,boxblur=12:2,scale=1080:1920,eq=saturation=1.2:contrast=1.05[bg_blurred];"
                     f"[main_raw]{crop_main}[fg_169];"
                     f"[bg_blurred][fg_169]overlay=0:656[main_base];"
                     f"{pip_crop}"
@@ -2536,7 +2991,7 @@ def build_ffmpeg_filtergraph(
         if background_style == "blurred":
             filters.append(
                 f"[0:v]split=2[bg_raw][fg_raw];"
-                f"[bg_raw]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:5,eq=saturation=1.2:contrast=1.05[bg_blurred];"
+                f"[bg_raw]scale=360:640:force_original_aspect_ratio=increase,crop=360:640,boxblur=12:2,scale=1080:1920,eq=saturation=1.2:contrast=1.05[bg_blurred];"
                 f"[fg_raw]{crop_11}[fg_square];"
                 f"[bg_blurred][fg_square]overlay=0:420[layout_base]"
             )
@@ -2556,7 +3011,7 @@ def build_ffmpeg_filtergraph(
         if background_style == "blurred":
             filters.append(
                 f"[0:v]split=2[bg_raw][fg_raw];"
-                f"[bg_raw]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:5,eq=saturation=1.2:contrast=1.05[bg_blurred];"
+                f"[bg_raw]scale=360:640:force_original_aspect_ratio=increase,crop=360:640,boxblur=12:2,scale=1080:1920,eq=saturation=1.2:contrast=1.05[bg_blurred];"
                 f"[fg_raw]{crop_43}[fg_43];"
                 f"[bg_blurred][fg_43]overlay=0:555[layout_base]"
             )
@@ -2588,7 +3043,7 @@ def build_ffmpeg_filtergraph(
         if background_style == "blurred":
             filters.append(
                 f"[0:v]split=2[bg_raw][fg_raw];"
-                f"[bg_raw]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:5,eq=saturation=1.2:contrast=1.05[bg_blurred];"
+                f"[bg_raw]scale=360:640:force_original_aspect_ratio=increase,crop=360:640,boxblur=12:2,scale=1080:1920,eq=saturation=1.2:contrast=1.05[bg_blurred];"
                 f"[fg_raw]{crop_169}[fg_169];"
                 f"[bg_blurred][fg_169]overlay=0:656[layout_base]"
             )
@@ -2602,8 +3057,8 @@ def build_ffmpeg_filtergraph(
     # (If ass_subtitles_path is provided, it contains BOTH the title and subtitles rendered with exact matching fonts)
     if ass_subtitles_path and os.path.exists(ass_subtitles_path):
         raw_ass = str(Path(ass_subtitles_path).resolve()).replace("\\", "/")
-        escaped_ass = raw_ass.replace("'", "'\\''").replace(":", "\\:")
-        if FONTS_DIR.exists() and any(FONTS_DIR.glob("*.ttf")):
+        escaped_ass = raw_ass.replace(":", "\\:").replace("'", "'\\''")
+        if FONTS_DIR.exists() and (any(FONTS_DIR.glob("*.ttf")) or any(FONTS_DIR.glob("*.otf")) or any(FONTS_DIR.glob("*.woff*"))):
             raw_fonts = str(FONTS_DIR.resolve()).replace("\\", "/")
             escaped_fonts = raw_fonts.replace("'", "'\\''").replace(":", "\\:")
             sub_filter = f"{current_v}subtitles=filename='{escaped_ass}':fontsdir='{escaped_fonts}'[v_final]"
@@ -2622,8 +3077,10 @@ def build_ffmpeg_filtergraph(
         else:
             y_pos = 80 if aspect_ratio == "16:9_landscape" else (345 if aspect_ratio == "1:1" else (480 if aspect_ratio in ["4:3", "9:16"] else 581))
         box_style = "box=0"
+        safe_font = get_ffmpeg_safe_font_path()
+        font_arg = f":fontfile='{safe_font}'" if safe_font else ""
         title_filter = (
-            f"{current_v}drawtext=text='{clean_title}':fontsize=60:fontcolor=white:"
+            f"{current_v}drawtext=text='{clean_title}'{font_arg}:fontsize=60:fontcolor=white:"
             f"x=(w-text_w)/2:y={y_pos}:borderw=2.5:bordercolor=black@0.8:{box_style}[v_with_title]"
         )
         filters.append(title_filter)
@@ -2784,19 +3241,48 @@ def render_clip_to_mp4(
             out_video_map = "[v_watermarked]"
 
         elif watermark_text and watermark_text.strip():
-            clean_text = watermark_text.replace("'", "").replace(":", "\\:").replace("%", "").strip()
-            # Font size scaled smoothly across 0-500% range: 20% -> 36px, 100% -> 180px, 500% -> 900px
-            wm_font_size = max(10, min(900, int(180 * (float(watermark_size) / 100.0))))
-            # Center-based positioning: text anchor is centered at (X%, Y%) coordinates on the canvas
-            overlay_x_expr = f"w*{wm_x_ratio:.4f}-text_w/2"
-            overlay_y_expr = f"h*{wm_y_ratio:.4f}-text_h/2"
-            drawtext_cmd = (
-                f"{out_video_map}drawtext=text='{clean_text}':fontsize={wm_font_size}:"
-                f"fontcolor=white@{wm_opacity:.2f}:borderw=2:bordercolor=black@{wm_opacity:.2f}:"
-                f"x='{overlay_x_expr}':y='{overlay_y_expr}'[v_watermarked]"
+            # Render text watermark to a transparent PNG overlay using Pillow
+            # This completely avoids FFmpeg Fontconfig bugs on Windows while adding emoji & anti-aliasing support
+            wm_font_size = max(14, min(900, int(180 * (float(watermark_size) / 100.0))))
+            wm_png_filename = f"wm_text_{int(time.time() * 1000)}.png"
+            wm_png_path = TEMP_DIR / wm_png_filename
+            rendered_wm = render_text_watermark_png(
+                text=watermark_text.strip(),
+                output_png_path=str(wm_png_path),
+                font_name="Montserrat",
+                font_size=wm_font_size,
+                border_width=max(2, int(wm_font_size * 0.055))
             )
-            filter_chains.append(drawtext_cmd)
-            out_video_map = "[v_watermarked]"
+
+            if rendered_wm and os.path.exists(rendered_wm):
+                wm_idx = input_idx_counter
+                input_idx_counter += 1
+                extra_input_args.extend(["-i", str(rendered_wm)])
+
+                wm_prep = f"[{wm_idx}:v]format=rgba,colorchannelmixer=aa={wm_opacity:.2f}[wm_proc]"
+                filter_chains.append(wm_prep)
+
+                overlay_cmd = (
+                    f"{out_video_map}[wm_proc]overlay="
+                    f"x='main_w*{wm_x_ratio:.4f}-overlay_w/2':"
+                    f"y='main_h*{wm_y_ratio:.4f}-overlay_h/2':eval=init[v_watermarked]"
+                )
+                filter_chains.append(overlay_cmd)
+                out_video_map = "[v_watermarked]"
+            else:
+                # Fallback to drawtext with explicit fontfile (never relies on Fontconfig)
+                safe_font = get_ffmpeg_safe_font_path()
+                font_arg = f":fontfile='{safe_font}'" if safe_font else ""
+                clean_text = watermark_text.replace("'", "").replace(":", "\\:").replace("%", "").strip()
+                overlay_x_expr = f"w*{wm_x_ratio:.4f}-text_w/2"
+                overlay_y_expr = f"h*{wm_y_ratio:.4f}-text_h/2"
+                drawtext_cmd = (
+                    f"{out_video_map}drawtext=text='{clean_text}'{font_arg}:fontsize={wm_font_size}:"
+                    f"fontcolor=white@{wm_opacity:.2f}:borderw=2:bordercolor=black@{wm_opacity:.2f}:"
+                    f"x='{overlay_x_expr}':y='{overlay_y_expr}'[v_watermarked]"
+                )
+                filter_chains.append(drawtext_cmd)
+                out_video_map = "[v_watermarked]"
 
     # 2. Audio Processing (Original Audio with Boost, BGM with start offset, and Hook SFX at frame 0)
     audio_inputs_to_mix = []
@@ -2881,13 +3367,26 @@ def render_clip_to_mp4(
     if not shutil.which("ffmpeg"):
         raise RuntimeError("FFmpeg is not installed or not found in system PATH. Please install FFmpeg (e.g. 'winget install Gyan.FFmpeg') and restart your terminal.")
 
-    logger.info(f"Rendering final vertical clip to {output_mp4_path} with {chosen_encoder_name} (Selection: {hardware_accel}, BGM: {bgm_enabled}, Watermark: {watermark_enabled})...")
-    res = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-    if res.returncode != 0:
-        logger.warning(f"Hardware encoder ({chosen_encoder_name}) failed (code {res.returncode}): {res.stderr[:250] if res.stderr else ''}")
+    dur = max(1.0, float(clip_duration))
+    # Dynamic timeouts scaled to clip duration (e.g. 60s -> 600s / 10m, 120s -> 1080s / 18m, 180s -> 1560s / 26m)
+    render_timeout = max(360, min(2400, int(dur * 8) + 120))
+    cpu_render_timeout = max(480, min(3000, int(dur * 12) + 180))
+
+    logger.info(f"Rendering final vertical clip to {output_mp4_path} with {chosen_encoder_name} (Duration: {dur:.1f}s, Timeout: {render_timeout}s, Selection: {hardware_accel}, BGM: {bgm_enabled}, Watermark: {watermark_enabled})...")
+
+    res = None
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=render_timeout)
+    except subprocess.TimeoutExpired:
+        logger.warning(f"Hardware encoder ({chosen_encoder_name}) timed out after {render_timeout}s.")
+        res = None
+
+    if res is None or res.returncode != 0:
+        err_msg_initial = res.stderr[:250] if (res and res.stderr) else f"Timed out after {render_timeout}s"
+        logger.warning(f"Hardware encoder ({chosen_encoder_name}) failed or timed out: {err_msg_initial}")
         # Automatic fallback to universal CPU encoding (libx264) if chosen hardware encoder fails
         if chosen_encoder_name != "libx264":
-            logger.info("Retrying render with universal multi-threaded CPU encoder (libx264)...")
+            logger.info(f"Retrying render with universal multi-threaded CPU encoder (libx264, timeout: {cpu_render_timeout}s)...")
             cpu_cmd = [
                 "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                 "-i", str(video_path),
@@ -2895,14 +3394,25 @@ def render_clip_to_mp4(
                 "-filter_complex", final_filter_complex,
                 "-map", out_video_map,
                 "-map", out_audio_map,
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-threads", "2",
                 "-c:a", "aac", "-b:a", "192k",
                 "-pix_fmt", "yuv420p",
                 "-movflags", "+faststart",
                 "-shortest",
                 str(output_mp4_path)
             ]
-            res_cpu = subprocess.run(cpu_cmd, capture_output=True, text=True, timeout=240)
+            res_cpu = None
+            try:
+                res_cpu = subprocess.run(cpu_cmd, capture_output=True, text=True, timeout=cpu_render_timeout)
+            except subprocess.TimeoutExpired:
+                logger.error(f"FFmpeg CPU fallback timed out after {cpu_render_timeout}s.")
+                if os.path.exists(output_mp4_path):
+                    try:
+                        os.unlink(output_mp4_path)
+                    except Exception:
+                        pass
+                raise RuntimeError(f"FFmpeg rendering timed out after {cpu_render_timeout}s for clip of duration {dur:.1f}s.")
+
             if res_cpu.returncode == 0 and os.path.exists(output_mp4_path) and is_valid_mp4(output_mp4_path):
                 logger.info(f"Successfully rendered with CPU fallback: {output_mp4_path}")
                 return str(output_mp4_path)
@@ -2912,7 +3422,7 @@ def render_clip_to_mp4(
                         os.unlink(output_mp4_path)
                     except Exception:
                         pass
-                err_text = res_cpu.stderr or res.stderr or "Unknown FFmpeg error"
+                err_text = res_cpu.stderr if (res_cpu and res_cpu.stderr) else (res.stderr if (res and res.stderr) else "Unknown FFmpeg error")
                 if "moov atom not found" in err_text.lower():
                     raise RuntimeError("FFmpeg rendering failed: Source video segment is incomplete ('moov atom not found'). Please retry rendering this clip.")
                 logger.error(f"FFmpeg CPU fallback also failed: {err_text}")
@@ -2923,6 +3433,8 @@ def render_clip_to_mp4(
                     os.unlink(output_mp4_path)
                 except Exception:
                     pass
+            if res is None:
+                raise RuntimeError(f"FFmpeg rendering timed out after {render_timeout}s for clip of duration {dur:.1f}s.")
             err_text = res.stderr or "Unknown FFmpeg error"
             if "moov atom not found" in err_text.lower():
                 raise RuntimeError("FFmpeg rendering failed: Source video segment is incomplete ('moov atom not found'). Please retry rendering this clip.")
@@ -2932,7 +3444,7 @@ def render_clip_to_mp4(
     return str(output_mp4_path)
 
 
-def extract_clip_frame(video_url: str, video_id: str, timestamp: float = 0.0) -> Optional[str]:
+def extract_clip_frame(video_url: str, video_id: str, timestamp: float = 0.0, cookies_content: Optional[str] = None) -> Optional[str]:
     """
     Extracts a single JPEG image frame at timestamp for the real video preview.
     Caches the frame on disk in TEMP_DIR / 'frames'.
@@ -3008,23 +3520,24 @@ def extract_clip_frame(video_url: str, video_id: str, timestamp: float = 0.0) ->
     # 2. Extract a tiny 1-second slice of format 18 (fast 360p mp4) using yt-dlp + ffmpeg
     try:
         clean_url = video_url.strip() if video_url else f"https://www.youtube.com/watch?v={video_id}"
-        base_cmd = get_yt_dlp_base_cmd()
-        temp_slice = frames_dir / f"slice_{safe_id}_{sec}.mp4"
+        with ephemeral_cookies_file(cookies_content) as temp_cookies:
+            base_cmd = get_yt_dlp_base_cmd(include_cookies=True, cookies_path=temp_cookies)
+            temp_slice = frames_dir / f"slice_{safe_id}_{sec}.mp4"
 
-        t_start = target_ts
-        t_end = target_ts + 1.0
-        t_start_fmt = format_section_time(t_start)
-        t_end_fmt = format_section_time(t_end)
+            t_start = target_ts
+            t_end = target_ts + 1.0
+            t_start_fmt = format_section_time(t_start)
+            t_end_fmt = format_section_time(t_end)
 
-        slice_cmd = [
-            *base_cmd,
-            "-f", "18/best[height<=720]/best",
-            "--download-sections", f"*{t_start_fmt}-{t_end_fmt}",
-            "-o", str(temp_slice),
-            "--no-warnings",
-            clean_url
-        ]
-        subprocess.run(slice_cmd, capture_output=True, text=True, timeout=20)
+            slice_cmd = [
+                *base_cmd,
+                "-f", "18/best[height<=720]/best",
+                "--download-sections", f"*{t_start_fmt}-{t_end_fmt}",
+                "-o", str(temp_slice),
+                "--no-warnings",
+                clean_url
+            ]
+            subprocess.run(slice_cmd, capture_output=True, text=True, timeout=20)
         if temp_slice.exists() and temp_slice.stat().st_size > 1000:
             ff_cmd = [
                 "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
@@ -3052,7 +3565,6 @@ def extract_clip_frame(video_url: str, video_id: str, timestamp: float = 0.0) ->
 
     # 4. Instant high-res thumbnail fallback (guarantees frame preview NEVER gets stuck)
     try:
-        import urllib.request
         for thumb_url in [
             f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
             f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
